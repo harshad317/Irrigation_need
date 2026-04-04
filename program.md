@@ -97,8 +97,8 @@ Always keep the predictions from the model in a saperate folder called: `Predict
 
 `solution.py --autoloop` exists as a non-LLM fallback search loop. It is not the primary workflow. The preferred workflow is still:
 
-- `claude-opus-4-6` for research/control (lead agent)
-- `claude-sonnet-4-6` for coding, committing, and pushing (coding worker)
+- `gpt-5.4` with `extra high` reasoning for research/control (lead agent)
+- `gpt-5.3-codex` with `extra high` reasoning for coding, committing, and pushing (coding worker)
 
 ## Never stop
 
