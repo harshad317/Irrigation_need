@@ -21,9 +21,10 @@ if os.path.isdir(_libomp_dir) and "DYLD_LIBRARY_PATH" not in os.environ:
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
-from sklearn.preprocessing import LabelEncoder, OrdinalEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, OrdinalEncoder, StandardScaler
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, recall_score
 import lightgbm as lgb
@@ -37,6 +38,7 @@ N_FOLDS = 5
 TARGET = "Irrigation_Need"
 LABEL_ORDER = ["Low", "Medium", "High"]  # encoded as 0, 1, 2
 MIN_BLEND_WEIGHT = 0.05
+STACKER_N_JOBS = max(1, min(4, os.cpu_count() or 1))
 
 
 def parse_args():
@@ -49,7 +51,15 @@ def parse_args():
     )
     parser.add_argument(
         "--decision-policy",
-        choices=["argmax", "class_scale_search", "logreg_stack", "mlp_stack"],
+        choices=[
+            "argmax",
+            "class_scale_search",
+            "logreg_stack",
+            "mlp_stack",
+            "xgb_stack",
+            "hgb_stack",
+            "ordinal_xgb_stack",
+        ],
         default="argmax",
     )
     parser.add_argument("--prediction-cache", default="")
@@ -58,6 +68,10 @@ def parse_args():
     parser.add_argument("--risk-flags", action="store_true")
     parser.add_argument("--stress-signals", action="store_true")
     parser.add_argument("--meta-raw-features", action="store_true")
+    parser.add_argument("--meta-full-features", action="store_true")
+    parser.add_argument("--frequency-encoding", action="store_true")
+    parser.add_argument("--target-encoding", action="store_true")
+    parser.add_argument("--target-encoding-smoothing", type=float, default=50.0)
     return parser.parse_args()
 
 
@@ -85,6 +99,11 @@ print(f"Categorical crosses: {ARGS.categorical_crosses}")
 print(f"Risk flags: {ARGS.risk_flags}")
 print(f"Stress signals: {ARGS.stress_signals}")
 print(f"Meta raw features: {ARGS.meta_raw_features}")
+print(f"Meta full features: {ARGS.meta_full_features}")
+print(f"Frequency encoding: {ARGS.frequency_encoding}")
+print(f"Target encoding: {ARGS.target_encoding}")
+if ARGS.target_encoding:
+    print(f"Target encoding smoothing: {ARGS.target_encoding_smoothing:.1f}")
 
 # ── 2. Encode target ──────────────────────────────────────────────────────────
 
@@ -364,6 +383,50 @@ def search_class_scales(prob_matrix, y_true):
     return best_ba, best_scales, best_pred
 
 
+def predict_with_ordinal_thresholds(score_vector, thresholds):
+    lower, upper = thresholds
+    pred = np.zeros(len(score_vector), dtype=int)
+    pred[score_vector >= lower] = 1
+    pred[score_vector >= upper] = 2
+    return pred
+
+
+def search_ordinal_thresholds(score_vector, y_true):
+    best_thresholds = (0.85, 1.20)
+    best_pred = predict_with_ordinal_thresholds(score_vector, best_thresholds)
+    best_ba = balanced_accuracy_score(y_true, best_pred)
+
+    coarse_lower = np.arange(0.50, 1.01, 0.05)
+    coarse_upper = np.arange(1.00, 1.71, 0.05)
+
+    for lower in coarse_lower:
+        for upper in coarse_upper:
+            if upper <= lower + 0.10:
+                continue
+            thresholds = (float(round(lower, 3)), float(round(upper, 3)))
+            pred = predict_with_ordinal_thresholds(score_vector, thresholds)
+            ba = balanced_accuracy_score(y_true, pred)
+            if ba > best_ba:
+                best_ba = ba
+                best_thresholds = thresholds
+                best_pred = pred
+
+    center_lower, center_upper = best_thresholds
+    for lower in np.arange(center_lower - 0.08, center_lower + 0.081, 0.01):
+        for upper in np.arange(center_upper - 0.08, center_upper + 0.081, 0.01):
+            if upper <= lower + 0.05:
+                continue
+            thresholds = (float(round(lower, 3)), float(round(upper, 3)))
+            pred = predict_with_ordinal_thresholds(score_vector, thresholds)
+            ba = balanced_accuracy_score(y_true, pred)
+            if ba > best_ba:
+                best_ba = ba
+                best_thresholds = thresholds
+                best_pred = pred
+
+    return best_ba, best_thresholds, best_pred
+
+
 def resolve_prediction_cache_path(cache_path):
     if not cache_path:
         return ""
@@ -395,6 +458,34 @@ def stack_probabilities(prob_matrices):
         stacked_parts.append(np.max(matrix, axis=1, keepdims=True))
 
     return np.hstack(stacked_parts)
+
+
+def build_stack_feature_matrices(
+    prob_matrices_oof,
+    prob_matrices_test,
+    *,
+    meta_raw_train=None,
+    meta_raw_test=None,
+    meta_full_train=None,
+    meta_full_test=None,
+):
+    stack_train = stack_probabilities(prob_matrices_oof)
+    stack_test = stack_probabilities(prob_matrices_test)
+
+    extra_train_parts = []
+    extra_test_parts = []
+    if meta_raw_train is not None:
+        extra_train_parts.append(meta_raw_train)
+        extra_test_parts.append(meta_raw_test)
+    if meta_full_train is not None:
+        extra_train_parts.append(meta_full_train)
+        extra_test_parts.append(meta_full_test)
+
+    if extra_train_parts:
+        stack_train = np.hstack([stack_train, *extra_train_parts])
+        stack_test = np.hstack([stack_test, *extra_test_parts])
+
+    return stack_train, stack_test
 
 
 def build_meta_raw_features(df):
@@ -438,6 +529,89 @@ def build_meta_raw_features(df):
     return meta_frame.values.astype(float)
 
 
+def build_meta_full_features(train_df, test_df, numeric_cols, categorical_cols):
+    train_num = train_df[numeric_cols].to_numpy(dtype=np.float32, copy=True)
+    test_num = test_df[numeric_cols].to_numpy(dtype=np.float32, copy=True)
+
+    if not categorical_cols:
+        return train_num, test_num
+
+    encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False, dtype=np.float32)
+    train_cat = encoder.fit_transform(train_df[categorical_cols].astype(str))
+    test_cat = encoder.transform(test_df[categorical_cols].astype(str))
+
+    train_meta = np.hstack([train_num, train_cat]).astype(np.float32, copy=False)
+    test_meta = np.hstack([test_num, test_cat]).astype(np.float32, copy=False)
+    return train_meta, test_meta
+
+
+def add_frequency_encoding(train_df, test_df, columns):
+    feature_names = []
+    for col in columns:
+        feature_name = f"{col}__freq"
+        frequencies = train_df[col].value_counts(normalize=True, dropna=False)
+        train_df[feature_name] = train_df[col].map(frequencies).fillna(0.0).astype(float)
+        test_df[feature_name] = test_df[col].map(frequencies).fillna(0.0).astype(float)
+        feature_names.append(feature_name)
+    return feature_names
+
+
+def add_target_encoding(
+    train_df,
+    test_df,
+    y,
+    split_indices,
+    columns,
+    label_names,
+    smoothing,
+):
+    feature_names = []
+    priors = np.bincount(y, minlength=len(label_names)).astype(float) / len(y)
+
+    for col in columns:
+        train_series = train_df[col].astype(str)
+        test_series = test_df[col].astype(str)
+
+        for class_idx, label_name in enumerate(label_names):
+            feature_name = f"{col}__te_{label_name.lower()}"
+            train_feature = np.full(len(train_df), priors[class_idx], dtype=float)
+
+            for tr_idx, val_idx in split_indices:
+                fold_series = train_series.iloc[tr_idx]
+                fold_targets = pd.Series(
+                    (y[tr_idx] == class_idx).astype(float),
+                    index=fold_series.index,
+                )
+                fold_counts = fold_series.value_counts(dropna=False)
+                fold_positive = fold_targets.groupby(fold_series).sum()
+                mapping = (
+                    fold_positive.add(smoothing * priors[class_idx], fill_value=smoothing * priors[class_idx])
+                    / (fold_counts + smoothing)
+                )
+                train_feature[val_idx] = (
+                    train_series.iloc[val_idx].map(mapping).fillna(priors[class_idx]).to_numpy()
+                )
+
+            full_targets = pd.Series(
+                (y == class_idx).astype(float),
+                index=train_series.index,
+            )
+            full_counts = train_series.value_counts(dropna=False)
+            full_positive = full_targets.groupby(train_series).sum()
+            full_mapping = (
+                full_positive.add(smoothing * priors[class_idx], fill_value=smoothing * priors[class_idx])
+                / (full_counts + smoothing)
+            )
+
+            train_df[feature_name] = train_feature
+            test_df[feature_name] = (
+                test_series.map(full_mapping).fillna(priors[class_idx]).astype(float)
+            )
+            feature_names.append(feature_name)
+
+    return feature_names
+
+
 def run_logreg_stack(train_features, y_true, test_features, sample_weights):
     meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     candidate_cs = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
@@ -458,7 +632,7 @@ def run_logreg_stack(train_features, y_true, test_features, sample_weights):
                     C=c_value,
                     class_weight=class_weight,
                     max_iter=2000,
-                    n_jobs=-1,
+                    n_jobs=STACKER_N_JOBS,
                     solver="lbfgs",
                 )
                 model.fit(
@@ -484,7 +658,7 @@ def run_logreg_stack(train_features, y_true, test_features, sample_weights):
         C=best_config["C"],
         class_weight=best_config["class_weight"],
         max_iter=2000,
-        n_jobs=-1,
+        n_jobs=STACKER_N_JOBS,
         solver="lbfgs",
     )
     scaler = StandardScaler()
@@ -502,6 +676,21 @@ def run_mlp_stack(train_features, y_true, test_features, sample_weights):
         {"hidden_layer_sizes": (64, 32), "alpha": 1e-4, "learning_rate_init": 1e-3},
         {"hidden_layer_sizes": (128, 64), "alpha": 5e-4, "learning_rate_init": 1e-3},
     ]
+    if train_features.shape[1] > 40:
+        candidate_configs.extend(
+            [
+                {
+                    "hidden_layer_sizes": (128, 64, 32),
+                    "alpha": 3e-4,
+                    "learning_rate_init": 7e-4,
+                },
+                {
+                    "hidden_layer_sizes": (192, 96, 32),
+                    "alpha": 5e-4,
+                    "learning_rate_init": 5e-4,
+                },
+            ]
+        )
 
     best_score = -1.0
     best_pred = None
@@ -557,6 +746,267 @@ def run_mlp_stack(train_features, y_true, test_features, sample_weights):
 
     return best_score, best_pred, final_test_pred
 
+
+def run_xgb_stack(train_features, y_true, test_features, sample_weights):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    candidate_configs = [
+        {
+            "max_depth": 4,
+            "min_child_weight": 20,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "reg_alpha": 0.05,
+            "reg_lambda": 1.0,
+        },
+        {
+            "max_depth": 5,
+            "min_child_weight": 10,
+            "subsample": 0.85,
+            "colsample_bytree": 0.85,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.5,
+        },
+    ]
+
+    best_score = -1.0
+    best_pred = None
+    best_config = None
+
+    for config in candidate_configs:
+        oof_pred = np.zeros(len(y_true), dtype=int)
+        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+            model = xgb.XGBClassifier(
+                objective="multi:softprob",
+                num_class=3,
+                eval_metric="mlogloss",
+                n_estimators=1200,
+                learning_rate=0.05,
+                max_depth=config["max_depth"],
+                min_child_weight=config["min_child_weight"],
+                subsample=config["subsample"],
+                colsample_bytree=config["colsample_bytree"],
+                reg_alpha=config["reg_alpha"],
+                reg_lambda=config["reg_lambda"],
+                tree_method="hist",
+                random_state=SEED,
+                n_jobs=STACKER_N_JOBS,
+                verbosity=0,
+                early_stopping_rounds=50,
+            )
+            model.fit(
+                train_features[tr_idx],
+                y_true[tr_idx],
+                sample_weight=sample_weights[tr_idx],
+                eval_set=[(train_features[val_idx], y_true[val_idx])],
+                verbose=False,
+            )
+            oof_pred[val_idx] = model.predict(train_features[val_idx])
+
+        score = balanced_accuracy_score(y_true, oof_pred)
+        if score > best_score:
+            best_score = score
+            best_pred = oof_pred
+            best_config = config
+
+    print(
+        "Best xgb stack config — "
+        f"depth:{best_config['max_depth']} "
+        f"min_child_weight:{best_config['min_child_weight']} "
+        f"subsample:{best_config['subsample']:.2f} "
+        f"colsample:{best_config['colsample_bytree']:.2f}"
+    )
+
+    full_model = xgb.XGBClassifier(
+        objective="multi:softprob",
+        num_class=3,
+        eval_metric="mlogloss",
+        n_estimators=1200,
+        learning_rate=0.05,
+        max_depth=best_config["max_depth"],
+        min_child_weight=best_config["min_child_weight"],
+        subsample=best_config["subsample"],
+        colsample_bytree=best_config["colsample_bytree"],
+        reg_alpha=best_config["reg_alpha"],
+        reg_lambda=best_config["reg_lambda"],
+        tree_method="hist",
+        random_state=SEED,
+        n_jobs=STACKER_N_JOBS,
+        verbosity=0,
+    )
+    full_model.fit(train_features, y_true, sample_weight=sample_weights)
+    final_test_pred = full_model.predict(test_features)
+
+    return best_score, best_pred, final_test_pred
+
+
+def run_hgb_stack(train_features, y_true, test_features, sample_weights):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    candidate_configs = [
+        {
+            "learning_rate": 0.05,
+            "max_depth": 6,
+            "max_leaf_nodes": 63,
+            "min_samples_leaf": 200,
+            "l2_regularization": 0.1,
+        },
+        {
+            "learning_rate": 0.04,
+            "max_depth": 8,
+            "max_leaf_nodes": 127,
+            "min_samples_leaf": 100,
+            "l2_regularization": 0.3,
+        },
+    ]
+
+    best_score = -1.0
+    best_pred = None
+    best_config = None
+
+    for config in candidate_configs:
+        oof_pred = np.zeros(len(y_true), dtype=int)
+        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+            model = HistGradientBoostingClassifier(
+                learning_rate=config["learning_rate"],
+                max_depth=config["max_depth"],
+                max_leaf_nodes=config["max_leaf_nodes"],
+                min_samples_leaf=config["min_samples_leaf"],
+                l2_regularization=config["l2_regularization"],
+                max_iter=300,
+                early_stopping=True,
+                random_state=SEED,
+            )
+            model.fit(
+                train_features[tr_idx],
+                y_true[tr_idx],
+                sample_weight=sample_weights[tr_idx],
+            )
+            oof_pred[val_idx] = model.predict(train_features[val_idx])
+
+        score = balanced_accuracy_score(y_true, oof_pred)
+        if score > best_score:
+            best_score = score
+            best_pred = oof_pred
+            best_config = config
+
+    print(
+        "Best hgb stack config — "
+        f"depth:{best_config['max_depth']} "
+        f"leaf_nodes:{best_config['max_leaf_nodes']} "
+        f"min_samples_leaf:{best_config['min_samples_leaf']} "
+        f"l2:{best_config['l2_regularization']:.2f}"
+    )
+
+    full_model = HistGradientBoostingClassifier(
+        learning_rate=best_config["learning_rate"],
+        max_depth=best_config["max_depth"],
+        max_leaf_nodes=best_config["max_leaf_nodes"],
+        min_samples_leaf=best_config["min_samples_leaf"],
+        l2_regularization=best_config["l2_regularization"],
+        max_iter=300,
+        early_stopping=True,
+        random_state=SEED,
+    )
+    full_model.fit(train_features, y_true, sample_weight=sample_weights)
+    final_test_pred = full_model.predict(test_features)
+
+    return best_score, best_pred, final_test_pred
+
+
+def run_ordinal_xgb_stack(train_features, y_true, test_features, sample_weights):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    candidate_configs = [
+        {
+            "max_depth": 4,
+            "min_child_weight": 20,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "reg_alpha": 0.05,
+            "reg_lambda": 1.0,
+        },
+        {
+            "max_depth": 5,
+            "min_child_weight": 10,
+            "subsample": 0.85,
+            "colsample_bytree": 0.85,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.5,
+        },
+    ]
+
+    best_score = -1.0
+    best_pred = None
+    best_config = None
+    best_thresholds = None
+
+    for config in candidate_configs:
+        oof_score = np.zeros(len(y_true), dtype=float)
+        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+            model = xgb.XGBRegressor(
+                objective="reg:squarederror",
+                n_estimators=1200,
+                learning_rate=0.05,
+                max_depth=config["max_depth"],
+                min_child_weight=config["min_child_weight"],
+                subsample=config["subsample"],
+                colsample_bytree=config["colsample_bytree"],
+                reg_alpha=config["reg_alpha"],
+                reg_lambda=config["reg_lambda"],
+                tree_method="hist",
+                random_state=SEED,
+                n_jobs=STACKER_N_JOBS,
+                verbosity=0,
+                early_stopping_rounds=50,
+            )
+            model.fit(
+                train_features[tr_idx],
+                y_true[tr_idx],
+                sample_weight=sample_weights[tr_idx],
+                eval_set=[(train_features[val_idx], y_true[val_idx])],
+                verbose=False,
+            )
+            oof_score[val_idx] = model.predict(train_features[val_idx])
+
+        score, thresholds, pred = search_ordinal_thresholds(oof_score, y_true)
+        if score > best_score:
+            best_score = score
+            best_pred = pred
+            best_config = config
+            best_thresholds = thresholds
+
+    print(
+        "Best ordinal xgb stack config — "
+        f"depth:{best_config['max_depth']} "
+        f"min_child_weight:{best_config['min_child_weight']} "
+        f"subsample:{best_config['subsample']:.2f} "
+        f"colsample:{best_config['colsample_bytree']:.2f}"
+    )
+    print(
+        "Best ordinal thresholds — "
+        f"low_to_medium:{best_thresholds[0]:.3f} "
+        f"medium_to_high:{best_thresholds[1]:.3f}"
+    )
+
+    full_model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=1200,
+        learning_rate=0.05,
+        max_depth=best_config["max_depth"],
+        min_child_weight=best_config["min_child_weight"],
+        subsample=best_config["subsample"],
+        colsample_bytree=best_config["colsample_bytree"],
+        reg_alpha=best_config["reg_alpha"],
+        reg_lambda=best_config["reg_lambda"],
+        tree_method="hist",
+        random_state=SEED,
+        n_jobs=STACKER_N_JOBS,
+        verbosity=0,
+    )
+    full_model.fit(train_features, y_true, sample_weight=sample_weights)
+    test_scores = full_model.predict(test_features)
+    final_test_pred = predict_with_ordinal_thresholds(test_scores, best_thresholds)
+
+    return best_score, best_pred, final_test_pred
+
 train = add_features(train)
 test  = add_features(test)
 
@@ -565,11 +1015,34 @@ CAT_COLS = (
     + (CROSS_CAT_COLS if ARGS.categorical_crosses else [])
     + (STRESS_CAT_COLS if ARGS.stress_signals else [])
 )
+y = train["label"].values
+skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+split_indices = list(skf.split(train, y))
+
+ENCODING_NUM_COLS = []
+if ARGS.frequency_encoding:
+    ENCODING_NUM_COLS.extend(add_frequency_encoding(train, test, CAT_COLS))
+if ARGS.target_encoding:
+    ENCODING_NUM_COLS.extend(
+        add_target_encoding(
+            train,
+            test,
+            y,
+            split_indices,
+            CAT_COLS,
+            LABEL_ORDER,
+            ARGS.target_encoding_smoothing,
+        )
+    )
+if ENCODING_NUM_COLS:
+    print(f"Generated encoding feature count: {len(ENCODING_NUM_COLS)}")
+
 MODEL_NUM_COLS = (
     NUM_COLS
     + ENG_COLS
     + (RISK_FLAG_COLS if ARGS.risk_flags else [])
     + (STRESS_NUM_COLS if ARGS.stress_signals else [])
+    + ENCODING_NUM_COLS
 )
 FEAT_COLS = MODEL_NUM_COLS + CAT_COLS  # used by CatBoost
 
@@ -583,9 +1056,32 @@ X_test_num = test[MODEL_NUM_COLS].values
 
 X      = np.hstack([X_num, train_cat_enc])
 X_test = np.hstack([X_test_num, test_cat_enc])
-y      = train["label"].values
 meta_train_raw = build_meta_raw_features(train)
 meta_test_raw = build_meta_raw_features(test)
+meta_train_full = None
+meta_test_full = None
+if ARGS.meta_full_features and ARGS.decision_policy in {
+    "logreg_stack",
+    "mlp_stack",
+    "xgb_stack",
+    "hgb_stack",
+    "ordinal_xgb_stack",
+}:
+    meta_cat_cols = (
+        BASE_CAT_COLS
+        + (CROSS_CAT_COLS if ARGS.categorical_crosses else [])
+        + (STRESS_CAT_COLS if ARGS.stress_signals else [])
+    )
+    meta_train_full, meta_test_full = build_meta_full_features(
+        train,
+        test,
+        MODEL_NUM_COLS,
+        meta_cat_cols,
+    )
+    print(
+        "Meta full feature width: "
+        f"{meta_train_full.shape[1]} (numeric {len(MODEL_NUM_COLS)} + categorical expansion)"
+    )
 
 lgb_cat_indices = list(range(len(MODEL_NUM_COLS), X.shape[1]))
 
@@ -599,7 +1095,6 @@ print(f"Class weights: {dict(zip(LABEL_ORDER, class_weights.round(3)))}")
 
 # ── 5. CV setup (seed=45, 5-fold ≈ 20% val each fold per protocol) ───────────
 
-skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 n_classes = 3
 
 oof_lgb  = np.zeros((len(X), n_classes))
@@ -656,7 +1151,7 @@ else:
         verbose          = -1,
     )
 
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+    for fold, (tr_idx, val_idx) in enumerate(split_indices):
         X_tr, X_val = X[tr_idx], X[val_idx]
         y_tr, y_val = y[tr_idx], y[val_idx]
 
@@ -702,7 +1197,7 @@ else:
         early_stopping_rounds = 100,
     )
 
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+    for fold, (tr_idx, val_idx) in enumerate(split_indices):
         X_tr, X_val = X[tr_idx], X[val_idx]
         y_tr, y_val = y[tr_idx], y[val_idx]
 
@@ -732,7 +1227,7 @@ else:
     X_test_cb = test[FEAT_COLS].values
     cat_col_indices = [FEAT_COLS.index(c) for c in CAT_COLS]
 
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_cb, y)):
+    for fold, (tr_idx, val_idx) in enumerate(split_indices):
         X_tr, X_val = X_cb[tr_idx], X_cb[val_idx]
         y_tr, y_val = y[tr_idx], y[val_idx]
 
@@ -817,32 +1312,62 @@ if ARGS.decision_policy == "class_scale_search":
         blend_probabilities(prob_matrices_test, best_w),
         class_scales,
     )
-elif ARGS.decision_policy == "logreg_stack":
-    stack_train = stack_probabilities(prob_matrices_oof)
-    stack_test = stack_probabilities(prob_matrices_test)
-    if ARGS.meta_raw_features:
-        stack_train = np.hstack([stack_train, meta_train_raw])
-        stack_test = np.hstack([stack_test, meta_test_raw])
-    best_ba, ensemble_oof_pred, test_pred_idx = run_logreg_stack(
-        stack_train,
-        y,
-        stack_test,
-        sample_weights,
+elif ARGS.decision_policy in {
+    "logreg_stack",
+    "mlp_stack",
+    "xgb_stack",
+    "hgb_stack",
+    "ordinal_xgb_stack",
+}:
+    stack_train, stack_test = build_stack_feature_matrices(
+        prob_matrices_oof,
+        prob_matrices_test,
+        meta_raw_train=meta_train_raw if ARGS.meta_raw_features else None,
+        meta_raw_test=meta_test_raw if ARGS.meta_raw_features else None,
+        meta_full_train=meta_train_full if ARGS.meta_full_features else None,
+        meta_full_test=meta_test_full if ARGS.meta_full_features else None,
     )
-    print("Meta-model: multinomial logistic regression on cached OOF probabilities")
-elif ARGS.decision_policy == "mlp_stack":
-    stack_train = stack_probabilities(prob_matrices_oof)
-    stack_test = stack_probabilities(prob_matrices_test)
-    if ARGS.meta_raw_features:
-        stack_train = np.hstack([stack_train, meta_train_raw])
-        stack_test = np.hstack([stack_test, meta_test_raw])
-    best_ba, ensemble_oof_pred, test_pred_idx = run_mlp_stack(
-        stack_train,
-        y,
-        stack_test,
-        sample_weights,
-    )
-    print("Meta-model: ANN stacker on cached OOF probabilities")
+
+    if ARGS.decision_policy == "logreg_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_logreg_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+        )
+        print("Meta-model: multinomial logistic regression on cached OOF probabilities")
+    elif ARGS.decision_policy == "mlp_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_mlp_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+        )
+        print("Meta-model: ANN stacker on cached OOF probabilities")
+    elif ARGS.decision_policy == "xgb_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_xgb_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+        )
+        print("Meta-model: XGBoost stacker on cached OOF probabilities")
+    elif ARGS.decision_policy == "hgb_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_hgb_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+        )
+        print("Meta-model: HistGradientBoosting stacker on cached OOF probabilities")
+    elif ARGS.decision_policy == "ordinal_xgb_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_ordinal_xgb_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+        )
+        print("Meta-model: ordinal XGBoost regressor stacker on cached OOF probabilities")
 print(f"Ensemble OOF BA: {best_ba:.4f}")
 print_class_diagnostics(y, ensemble_oof_pred, LABEL_ORDER)
 

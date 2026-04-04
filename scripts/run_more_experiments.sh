@@ -40,3 +40,33 @@ run_experiment stress_signals_logreg_stack.log \
   --meta-raw-features \
   --prediction-cache "$STRESS_CACHE" \
   --skip-predictions
+
+run_experiment stress_signals_ann_stack_full.log \
+  --run-name stress_signals_ann_stack_full_v1 \
+  --categorical-crosses \
+  --risk-flags \
+  --stress-signals \
+  --decision-policy mlp_stack \
+  --meta-full-features \
+  --prediction-cache "$STRESS_CACHE" \
+  --skip-predictions
+
+run_experiment stress_signals_xgb_stack.log \
+  --run-name stress_signals_xgb_stack_v1 \
+  --categorical-crosses \
+  --risk-flags \
+  --stress-signals \
+  --decision-policy xgb_stack \
+  --meta-full-features \
+  --prediction-cache "$STRESS_CACHE" \
+  --skip-predictions
+
+run_experiment stress_signals_hgb_stack.log \
+  --run-name stress_signals_hgb_stack_v1 \
+  --categorical-crosses \
+  --risk-flags \
+  --stress-signals \
+  --decision-policy hgb_stack \
+  --meta-full-features \
+  --prediction-cache "$STRESS_CACHE" \
+  --skip-predictions
