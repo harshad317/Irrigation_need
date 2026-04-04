@@ -7,6 +7,7 @@ Run with:
     uv run scripts/solution.py
 """
 
+import argparse
 import os, sys
 
 # Fix libomp path on macOS without Homebrew (uses sklearn's bundled libomp)
@@ -22,7 +23,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, confusion_matrix, recall_score
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
@@ -33,6 +34,21 @@ SEED = 45          # fixed validation split seed per evaluation protocol
 N_FOLDS = 5
 TARGET = "Irrigation_Need"
 LABEL_ORDER = ["Low", "Medium", "High"]  # encoded as 0, 1, 2
+MIN_BLEND_WEIGHT = 0.05
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-name", default="manual")
+    parser.add_argument(
+        "--blend-strategy",
+        choices=["coarse_grid", "refined_weight_search"],
+        default="refined_weight_search",
+    )
+    return parser.parse_args()
+
+
+ARGS = parse_args()
 
 # Paths
 DATA_DIR = os.path.join(_project_root, "Data")
@@ -47,6 +63,8 @@ sub   = pd.read_csv(os.path.join(DATA_DIR, "sample_submission.csv"))
 
 print(f"Train: {train.shape}  Test: {test.shape}")
 print("Target distribution:\n", train[TARGET].value_counts())
+print(f"Run name: {ARGS.run_name}")
+print(f"Blend strategy: {ARGS.blend_strategy}")
 
 # ── 2. Encode target ──────────────────────────────────────────────────────────
 
@@ -89,6 +107,86 @@ def add_features(df):
     # Soil quality (organic carbon vs salinity)
     df["soil_quality"]    = df["Organic_Carbon"] / (df["Electrical_Conductivity"] + 0.01)
     return df
+
+
+def print_class_diagnostics(y_true, y_pred, label_names):
+    class_ids = np.arange(len(label_names))
+    class_recalls = recall_score(
+        y_true,
+        y_pred,
+        labels=class_ids,
+        average=None,
+        zero_division=0,
+    )
+    recall_summary = " ".join(
+        f"{label}={recall:.6f}" for label, recall in zip(label_names, class_recalls)
+    )
+    weakest_idx = int(np.argmin(class_recalls))
+
+    print(f"per_class_recall: {recall_summary}")
+    print(
+        "weakest_class_recall: "
+        f"{label_names[weakest_idx]}={class_recalls[weakest_idx]:.6f}"
+    )
+
+    cm = confusion_matrix(y_true, y_pred, labels=class_ids)
+    for label, row in zip(label_names, cm):
+        row_summary = ", ".join(
+            f"{pred_label}:{int(count)}" for pred_label, count in zip(label_names, row)
+        )
+        print(f"confusion_matrix[{label}]: {row_summary}")
+
+
+def blend_probabilities(prob_matrices, weights):
+    blend = np.zeros_like(prob_matrices[0])
+    for weight, matrix in zip(weights, prob_matrices):
+        blend += weight * matrix
+    return blend
+
+
+def search_coarse_weights(prob_matrices, y_true):
+    best_ba, best_w = 0.0, (1 / 3, 1 / 3, 1 / 3)
+    for w1 in np.arange(0.1, 0.8, 0.05):
+        for w2 in np.arange(0.1, 0.8, 0.05):
+            w3 = 1.0 - w1 - w2
+            if w3 < MIN_BLEND_WEIGHT:
+                continue
+            weights = (float(w1), float(w2), float(w3))
+            blend = blend_probabilities(prob_matrices, weights)
+            ba = balanced_accuracy_score(y_true, np.argmax(blend, axis=1))
+            if ba > best_ba:
+                best_ba, best_w = ba, weights
+    return best_ba, best_w
+
+
+def search_refined_weights(prob_matrices, y_true):
+    coarse_ba, coarse_w = search_coarse_weights(prob_matrices, y_true)
+    candidate_weights = {tuple(round(w, 6) for w in coarse_w)}
+
+    center = np.array(coarse_w)
+    for delta1 in np.arange(-0.08, 0.081, 0.01):
+        for delta2 in np.arange(-0.08, 0.081, 0.01):
+            weights = np.array([center[0] + delta1, center[1] + delta2, 0.0], dtype=float)
+            weights[2] = 1.0 - weights[0] - weights[1]
+            if np.any(weights < MIN_BLEND_WEIGHT) or np.any(weights > 0.90):
+                continue
+            candidate_weights.add(tuple(np.round(weights, 6)))
+
+    rng = np.random.default_rng(SEED)
+    random_weights = rng.dirichlet(np.ones(3), size=5000)
+    for weights in random_weights:
+        if weights.min() < MIN_BLEND_WEIGHT or weights.max() > 0.90:
+            continue
+        candidate_weights.add(tuple(np.round(weights, 6)))
+
+    best_ba, best_w = coarse_ba, coarse_w
+    for weights in sorted(candidate_weights):
+        blend = blend_probabilities(prob_matrices, weights)
+        ba = balanced_accuracy_score(y_true, np.argmax(blend, axis=1))
+        if ba > best_ba:
+            best_ba, best_w = ba, weights
+
+    return best_ba, best_w, coarse_ba, coarse_w, len(candidate_weights)
 
 train = add_features(train)
 test  = add_features(test)
@@ -141,7 +239,7 @@ print("─"*50)
 lgb_params = dict(
     objective        = "multiclass",
     num_class        = 3,
-    metric           = "None",
+    metric           = "multi_logloss",
     n_estimators     = 3000,
     learning_rate    = 0.05,
     num_leaves       = 127,
@@ -243,8 +341,7 @@ for fold, (tr_idx, val_idx) in enumerate(skf.split(X_cb, y)):
         depth              = 7,
         l2_leaf_reg        = 3,
         loss_function      = "MultiClass",
-        eval_metric        = "TotalF1",
-        auto_class_weights = "Balanced",
+        eval_metric        = "MultiClass",
         cat_features       = cat_col_indices,
         random_seed        = SEED,
         early_stopping_rounds = 100,
@@ -269,19 +366,29 @@ print("\n" + "─"*50)
 print("Ensemble weight search")
 print("─"*50)
 
-best_ba, best_w = 0, (1/3, 1/3, 1/3)
-for w1 in np.arange(0.1, 0.8, 0.05):
-    for w2 in np.arange(0.1, 0.8, 0.05):
-        w3 = 1.0 - w1 - w2
-        if w3 < 0.05:
-            continue
-        blend = w1 * oof_lgb + w2 * oof_xgb + w3 * oof_cat
-        ba = balanced_accuracy_score(y, np.argmax(blend, axis=1))
-        if ba > best_ba:
-            best_ba, best_w = ba, (w1, w2, w3)
+prob_matrices_oof = [oof_lgb, oof_xgb, oof_cat]
+prob_matrices_test = [pred_lgb, pred_xgb, pred_cat]
+
+if ARGS.blend_strategy == "refined_weight_search":
+    best_ba, best_w, coarse_ba, coarse_w, n_candidates = search_refined_weights(
+        prob_matrices_oof,
+        y,
+    )
+    print(
+        f"Coarse seed weights — LGB:{coarse_w[0]:.2f}  "
+        f"XGB:{coarse_w[1]:.2f}  CAT:{coarse_w[2]:.2f}"
+    )
+    print(f"Coarse seed BA: {coarse_ba:.6f}")
+    print(f"Refined candidate count: {n_candidates}")
+else:
+    best_ba, best_w = search_coarse_weights(prob_matrices_oof, y)
+
+best_blend = blend_probabilities(prob_matrices_oof, best_w)
+ensemble_oof_pred = np.argmax(best_blend, axis=1)
 
 print(f"Best weights — LGB:{best_w[0]:.2f}  XGB:{best_w[1]:.2f}  CAT:{best_w[2]:.2f}")
 print(f"Ensemble OOF BA: {best_ba:.4f}")
+print_class_diagnostics(y, ensemble_oof_pred, LABEL_ORDER)
 
 # Summary lines (greppable by lead agent)
 avg_best_iter = int(np.mean(best_iters_lgb + best_iters_xgb))
@@ -290,7 +397,7 @@ print(f"best_iteration: {avg_best_iter}")
 
 # ── 10. Generate submission ───────────────────────────────────────────────────
 
-test_blend = best_w[0] * pred_lgb + best_w[1] * pred_xgb + best_w[2] * pred_cat
+test_blend = blend_probabilities(prob_matrices_test, best_w)
 test_pred  = label_enc.inverse_transform(np.argmax(test_blend, axis=1))
 
 sub["Irrigation_Need"] = test_pred

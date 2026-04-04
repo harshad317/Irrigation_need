@@ -2,7 +2,7 @@
 
 This repository contains a tabular classification solution for the Kaggle competition [Predicting Irrigation Need](https://www.kaggle.com/competitions/playground-series-s6e4/overview), part of the Playground Series Season 6 Episode 4. The goal is to predict the categorical target `Irrigation_Need` (`Low`, `Medium`, `High`) from soil, crop, weather, and irrigation-management features.
 
-The current approach is a weighted ensemble of LightGBM, XGBoost, and CatBoost trained with stratified cross-validation, feature engineering, and explicit imbalance handling.
+The current approach is a refined weighted ensemble of LightGBM, XGBoost, and CatBoost trained with stratified cross-validation, feature engineering, explicit imbalance handling, and a constrained post-hoc blend search.
 
 ## Competition Summary
 
@@ -15,11 +15,13 @@ The current approach is a weighted ensemble of LightGBM, XGBoost, and CatBoost t
 
 ```text
 .
+├── artifacts/
 ├── Data/
 │   ├── train.csv
 │   ├── test.csv
 │   └── sample_submission.csv
 ├── Predictions/
+├── pyproject.toml
 ├── scripts/
 │   └── solution.py
 ├── program.md
@@ -75,7 +77,7 @@ This imbalance is important: the script computes inverse-frequency class weights
 6. Build inverse-frequency sample weights from the class distribution
 7. Train three models with 5-fold `StratifiedKFold` (`shuffle=True`, `random_state=45`)
 8. Collect out-of-fold class probabilities for each model
-9. Search ensemble weights over the LightGBM, XGBoost, and CatBoost predictions
+9. Run a constrained refined search over the LightGBM, XGBoost, and CatBoost ensemble weights
 10. Generate the final Kaggle submission file at `Predictions/prediction_irr_need.csv`
 
 ## Models Used
@@ -87,6 +89,7 @@ The current ensemble contains:
 - CatBoost multiclass classifier
 
 All three models use early stopping, and the final submission is produced from the best out-of-fold blend found on the validation predictions.
+The default run path now uses the refined blend search; `--blend-strategy coarse_grid` is still available for comparison runs.
 
 ## Validation Protocol
 
@@ -107,14 +110,13 @@ best_iteration: ...
 
 ## Setup
 
-This repository does not currently include a pinned `pyproject.toml` or `requirements.txt`, so dependencies need to be installed manually.
+This repository includes a pinned `pyproject.toml` for the baseline training stack and expects Python `3.13`.
 
 Example setup with `uv`:
 
 ```bash
-uv venv .venv
-source .venv/bin/activate
-uv pip install numpy pandas scikit-learn lightgbm xgboost catboost
+uv venv --python 3.13
+uv sync
 ```
 
 ## Run Training and Create a Submission
@@ -126,6 +128,7 @@ uv run scripts/solution.py
 To save the full log and extract the final summary values:
 
 ```bash
+rm -f run.log
 uv run scripts/solution.py > run.log 2>&1
 grep '^val_balanced_accuracy_score:\|^best_iteration:' run.log
 ```
@@ -136,6 +139,7 @@ After a successful run, the repository will contain:
 
 - `Predictions/prediction_irr_need.csv`: submission file in Kaggle format
 - `run.log`: optional local training log if you redirect stdout/stderr
+- `artifacts/champion_score_history.svg`: score chart generated from local `results.tsv`
 
 The script also prints:
 
@@ -144,6 +148,14 @@ The script also prints:
 - Per-fold balanced accuracy for each model
 - Overall out-of-fold balanced accuracy for LightGBM, XGBoost, CatBoost, and the final ensemble
 - The selected ensemble weights
+- Final ensemble per-class recall and weakest-class recall
+- Final ensemble confusion matrix rows for `Low`, `Medium`, and `High`
+
+To refresh the score chart after updating `results.tsv`:
+
+```bash
+uv run python scripts/update_score_chart.py
+```
 
 ## macOS Note
 
