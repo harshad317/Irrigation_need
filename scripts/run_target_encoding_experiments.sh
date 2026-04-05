@@ -103,3 +103,15 @@ run_experiment target_freq_hgb_stack.log \
   --meta-full-features \
   --prediction-cache "$TARGET_CACHE" \
   --skip-predictions
+
+run_experiment target_freq_ft_stack.log \
+  --run-name target_freq_ft_stack_v1 \
+  --categorical-crosses \
+  --risk-flags \
+  --stress-signals \
+  --frequency-encoding \
+  --target-encoding \
+  --decision-policy ft_transformer_stack \
+  --meta-raw-features \
+  --prediction-cache "$TARGET_CACHE" \
+  --skip-predictions

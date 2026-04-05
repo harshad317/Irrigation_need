@@ -70,3 +70,13 @@ run_experiment stress_signals_hgb_stack.log \
   --meta-full-features \
   --prediction-cache "$STRESS_CACHE" \
   --skip-predictions
+
+run_experiment stress_signals_ft_stack.log \
+  --run-name stress_signals_ft_stack_v1 \
+  --categorical-crosses \
+  --risk-flags \
+  --stress-signals \
+  --decision-policy ft_transformer_stack \
+  --meta-raw-features \
+  --prediction-cache "$STRESS_CACHE" \
+  --skip-predictions

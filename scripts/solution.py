@@ -25,20 +25,27 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, OrdinalEncoder, StandardScaler
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, recall_score
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
+from pytorch_tabnet.tab_model import TabNetClassifier
 import warnings
 warnings.filterwarnings("ignore")
+
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 SEED = 45          # fixed validation split seed per evaluation protocol
 N_FOLDS = 5
 TARGET = "Irrigation_Need"
 LABEL_ORDER = ["Low", "Medium", "High"]  # encoded as 0, 1, 2
+MODEL_LABELS = ["LGB", "XGB", "CAT"]
 MIN_BLEND_WEIGHT = 0.05
 STACKER_N_JOBS = max(1, min(4, os.cpu_count() or 1))
+torch.set_num_threads(STACKER_N_JOBS)
 
 
 def parse_args():
@@ -54,8 +61,16 @@ def parse_args():
         choices=[
             "argmax",
             "class_scale_search",
+            "model_scale_search",
             "logreg_stack",
             "mlp_stack",
+            "mlp_bag_stack",
+            "tabnet_stack",
+            "ann_cnn_combo_stack",
+            "neural_base_blend_stack",
+            "ft_transformer_stack",
+            "cnn_stack",
+            "rnn_stack",
             "xgb_stack",
             "hgb_stack",
             "ordinal_xgb_stack",
@@ -72,6 +87,7 @@ def parse_args():
     parser.add_argument("--frequency-encoding", action="store_true")
     parser.add_argument("--target-encoding", action="store_true")
     parser.add_argument("--target-encoding-smoothing", type=float, default=50.0)
+    parser.add_argument("--stack-class-scale-search", action="store_true")
     return parser.parse_args()
 
 
@@ -102,6 +118,7 @@ print(f"Meta raw features: {ARGS.meta_raw_features}")
 print(f"Meta full features: {ARGS.meta_full_features}")
 print(f"Frequency encoding: {ARGS.frequency_encoding}")
 print(f"Target encoding: {ARGS.target_encoding}")
+print(f"Stack class scale search: {ARGS.stack_class_scale_search}")
 if ARGS.target_encoding:
     print(f"Target encoding smoothing: {ARGS.target_encoding_smoothing:.1f}")
 
@@ -383,6 +400,104 @@ def search_class_scales(prob_matrix, y_true):
     return best_ba, best_scales, best_pred
 
 
+def format_class_scales(class_scales):
+    return (
+        f"Low:{class_scales[0]:.2f}  "
+        f"Medium:{class_scales[1]:.2f}  "
+        f"High:{class_scales[2]:.2f}"
+    )
+
+
+def print_class_scale_summary(prefix, class_scales):
+    if any(abs(scale - 1.0) > 1e-12 for scale in class_scales):
+        print(f"{prefix} — {format_class_scales(class_scales)}")
+
+
+def evaluate_probability_policy(prob_matrix, y_true, apply_class_scale_search):
+    pred = np.argmax(prob_matrix, axis=1)
+    score = balanced_accuracy_score(y_true, pred)
+    class_scales = (1.0, 1.0, 1.0)
+
+    if apply_class_scale_search:
+        score, class_scales, pred = search_class_scales(prob_matrix, y_true)
+
+    return score, pred, class_scales
+
+
+def build_model_scaled_blend(prob_matrices, weights, model_scales):
+    blend = np.zeros_like(prob_matrices[0])
+    for weight, matrix, scales in zip(weights, prob_matrices, model_scales):
+        blend += weight * matrix * np.asarray(scales, dtype=float)
+    return blend
+
+
+def search_model_class_scales(prob_matrices, weights, y_true):
+    medium_grid = np.arange(0.88, 1.121, 0.02)
+    high_grid = np.arange(0.80, 1.601, 0.02)
+    weighted = [weight * matrix for weight, matrix in zip(weights, prob_matrices)]
+    model_scales = [np.ones(prob_matrices[0].shape[1], dtype=float) for _ in prob_matrices]
+    blend = np.zeros_like(prob_matrices[0])
+    for weighted_matrix in weighted:
+        blend += weighted_matrix
+
+    best_pred = np.argmax(blend, axis=1)
+    best_ba = balanced_accuracy_score(y_true, best_pred)
+
+    for _ in range(3):
+        improved = False
+        for model_idx, weighted_matrix in enumerate(weighted):
+            current_scales = model_scales[model_idx].copy()
+            base_without_model = blend - weighted_matrix * current_scales
+
+            best_local_scales = current_scales.copy()
+            best_local_blend = blend
+
+            for medium_scale in medium_grid:
+                candidate_scales = current_scales.copy()
+                candidate_scales[1] = float(round(medium_scale, 2))
+                candidate_blend = base_without_model + weighted_matrix * candidate_scales
+                candidate_pred = np.argmax(candidate_blend, axis=1)
+                candidate_ba = balanced_accuracy_score(y_true, candidate_pred)
+                if candidate_ba > best_ba + 1e-12:
+                    best_ba = candidate_ba
+                    best_pred = candidate_pred
+                    best_local_scales = candidate_scales
+                    best_local_blend = candidate_blend
+                    improved = True
+
+            current_scales = best_local_scales.copy()
+            blend = best_local_blend
+            base_without_model = blend - weighted_matrix * current_scales
+
+            for high_scale in high_grid:
+                candidate_scales = current_scales.copy()
+                candidate_scales[2] = float(round(high_scale, 2))
+                candidate_blend = base_without_model + weighted_matrix * candidate_scales
+                candidate_pred = np.argmax(candidate_blend, axis=1)
+                candidate_ba = balanced_accuracy_score(y_true, candidate_pred)
+                if candidate_ba > best_ba + 1e-12:
+                    best_ba = candidate_ba
+                    best_pred = candidate_pred
+                    best_local_scales = candidate_scales
+                    best_local_blend = candidate_blend
+                    improved = True
+
+            model_scales[model_idx] = best_local_scales
+            blend = best_local_blend
+
+        if not improved:
+            break
+
+    class_ba, class_scales, class_pred = search_class_scales(blend, y_true)
+    if class_ba > best_ba + 1e-12:
+        best_ba = class_ba
+        best_pred = class_pred
+    else:
+        class_scales = (1.0, 1.0, 1.0)
+
+    return best_ba, model_scales, class_scales, best_pred
+
+
 def predict_with_ordinal_thresholds(score_vector, thresholds):
     lower, upper = thresholds
     pred = np.zeros(len(score_vector), dtype=int)
@@ -612,7 +727,13 @@ def add_target_encoding(
     return feature_names
 
 
-def run_logreg_stack(train_features, y_true, test_features, sample_weights):
+def run_logreg_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
     meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     candidate_cs = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
     candidate_weights = [None, "balanced"]
@@ -620,10 +741,11 @@ def run_logreg_stack(train_features, y_true, test_features, sample_weights):
     best_score = -1.0
     best_pred = None
     best_config = None
+    best_class_scales = (1.0, 1.0, 1.0)
 
     for class_weight in candidate_weights:
         for c_value in candidate_cs:
-            oof_pred = np.zeros(len(y_true), dtype=int)
+            oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
             for tr_idx, val_idx in meta_skf.split(train_features, y_true):
                 scaler = StandardScaler()
                 X_tr = scaler.fit_transform(train_features[tr_idx])
@@ -640,19 +762,25 @@ def run_logreg_stack(train_features, y_true, test_features, sample_weights):
                     y_true[tr_idx],
                     sample_weight=sample_weights[tr_idx],
                 )
-                oof_pred[val_idx] = model.predict(X_val)
+                oof_proba[val_idx] = model.predict_proba(X_val)
 
-            score = balanced_accuracy_score(y_true, oof_pred)
+            score, oof_pred, class_scales = evaluate_probability_policy(
+                oof_proba,
+                y_true,
+                apply_class_scale_search,
+            )
             if score > best_score:
                 best_score = score
                 best_pred = oof_pred
                 best_config = {"C": c_value, "class_weight": class_weight}
+                best_class_scales = class_scales
 
     print(
         "Best logreg stack config — "
         f"C:{best_config['C']:.2f} "
         f"class_weight:{best_config['class_weight'] or 'none'}"
     )
+    print_class_scale_summary("Best logreg stack class scales", best_class_scales)
 
     full_model = LogisticRegression(
         C=best_config["C"],
@@ -665,12 +793,19 @@ def run_logreg_stack(train_features, y_true, test_features, sample_weights):
     train_scaled = scaler.fit_transform(train_features)
     test_scaled = scaler.transform(test_features)
     full_model.fit(train_scaled, y_true, sample_weight=sample_weights)
-    final_test_pred = full_model.predict(test_scaled)
+    test_proba = full_model.predict_proba(test_scaled)
+    final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
 
     return best_score, best_pred, final_test_pred
 
 
-def run_mlp_stack(train_features, y_true, test_features, sample_weights):
+def run_mlp_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
     meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     candidate_configs = [
         {"hidden_layer_sizes": (64, 32), "alpha": 1e-4, "learning_rate_init": 1e-3},
@@ -695,9 +830,10 @@ def run_mlp_stack(train_features, y_true, test_features, sample_weights):
     best_score = -1.0
     best_pred = None
     best_config = None
+    best_class_scales = (1.0, 1.0, 1.0)
 
     for config in candidate_configs:
-        oof_pred = np.zeros(len(y_true), dtype=int)
+        oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
         for tr_idx, val_idx in meta_skf.split(train_features, y_true):
             scaler = StandardScaler()
             X_tr = scaler.fit_transform(train_features[tr_idx])
@@ -713,13 +849,18 @@ def run_mlp_stack(train_features, y_true, test_features, sample_weights):
                 random_state=SEED,
             )
             model.fit(X_tr, y_true[tr_idx], sample_weight=sample_weights[tr_idx])
-            oof_pred[val_idx] = model.predict(X_val)
+            oof_proba[val_idx] = model.predict_proba(X_val)
 
-        score = balanced_accuracy_score(y_true, oof_pred)
+        score, oof_pred, class_scales = evaluate_probability_policy(
+            oof_proba,
+            y_true,
+            apply_class_scale_search,
+        )
         if score > best_score:
             best_score = score
             best_pred = oof_pred
             best_config = config
+            best_class_scales = class_scales
 
     print(
         "Best mlp stack config — "
@@ -727,6 +868,7 @@ def run_mlp_stack(train_features, y_true, test_features, sample_weights):
         f"alpha:{best_config['alpha']:.5f} "
         f"lr:{best_config['learning_rate_init']:.5f}"
     )
+    print_class_scale_summary("Best mlp stack class scales", best_class_scales)
 
     scaler = StandardScaler()
     train_scaled = scaler.fit_transform(train_features)
@@ -742,12 +884,1199 @@ def run_mlp_stack(train_features, y_true, test_features, sample_weights):
         random_state=SEED,
     )
     full_model.fit(train_scaled, y_true, sample_weight=sample_weights)
-    final_test_pred = full_model.predict(test_scaled)
+    test_proba = full_model.predict_proba(test_scaled)
+    final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
 
     return best_score, best_pred, final_test_pred
 
 
-def run_xgb_stack(train_features, y_true, test_features, sample_weights):
+def run_mlp_bag_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    candidate_configs = [
+        {"hidden_layer_sizes": (64, 32), "alpha": 1e-4, "learning_rate_init": 1e-3},
+        {"hidden_layer_sizes": (128, 64), "alpha": 5e-4, "learning_rate_init": 1e-3},
+    ]
+    if train_features.shape[1] > 40:
+        candidate_configs.extend(
+            [
+                {
+                    "hidden_layer_sizes": (128, 64, 32),
+                    "alpha": 3e-4,
+                    "learning_rate_init": 7e-4,
+                },
+                {
+                    "hidden_layer_sizes": (192, 96, 32),
+                    "alpha": 5e-4,
+                    "learning_rate_init": 5e-4,
+                },
+            ]
+        )
+    bag_seeds = [SEED, SEED + 17, SEED + 41]
+
+    best_score = -1.0
+    best_pred = None
+    best_config = None
+    best_class_scales = (1.0, 1.0, 1.0)
+
+    for config in candidate_configs:
+        oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
+        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+            scaler = StandardScaler()
+            X_tr = scaler.fit_transform(train_features[tr_idx])
+            X_val = scaler.transform(train_features[val_idx])
+            fold_proba = np.zeros((len(val_idx), len(LABEL_ORDER)), dtype=np.float32)
+
+            for random_seed in bag_seeds:
+                model = MLPClassifier(
+                    hidden_layer_sizes=config["hidden_layer_sizes"],
+                    alpha=config["alpha"],
+                    learning_rate_init=config["learning_rate_init"],
+                    batch_size=4096,
+                    early_stopping=True,
+                    max_iter=80,
+                    n_iter_no_change=10,
+                    random_state=random_seed,
+                )
+                model.fit(X_tr, y_true[tr_idx], sample_weight=sample_weights[tr_idx])
+                fold_proba += model.predict_proba(X_val) / len(bag_seeds)
+
+            oof_proba[val_idx] = fold_proba
+
+        score, oof_pred, class_scales = evaluate_probability_policy(
+            oof_proba,
+            y_true,
+            apply_class_scale_search,
+        )
+        if score > best_score:
+            best_score = score
+            best_pred = oof_pred
+            best_config = config
+            best_class_scales = class_scales
+
+    print(
+        "Best mlp bag stack config — "
+        f"hidden:{best_config['hidden_layer_sizes']} "
+        f"alpha:{best_config['alpha']:.5f} "
+        f"lr:{best_config['learning_rate_init']:.5f} "
+        f"seeds:{bag_seeds}"
+    )
+    print_class_scale_summary("Best mlp bag stack class scales", best_class_scales)
+
+    scaler = StandardScaler()
+    train_scaled = scaler.fit_transform(train_features)
+    test_scaled = scaler.transform(test_features)
+    test_proba = np.zeros((len(test_features), len(LABEL_ORDER)), dtype=np.float32)
+
+    for random_seed in bag_seeds:
+        full_model = MLPClassifier(
+            hidden_layer_sizes=best_config["hidden_layer_sizes"],
+            alpha=best_config["alpha"],
+            learning_rate_init=best_config["learning_rate_init"],
+            batch_size=4096,
+            early_stopping=True,
+            max_iter=80,
+            n_iter_no_change=10,
+            random_state=random_seed,
+        )
+        full_model.fit(train_scaled, y_true, sample_weight=sample_weights)
+        test_proba += full_model.predict_proba(test_scaled) / len(bag_seeds)
+
+    final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
+    return best_score, best_pred, final_test_pred
+
+
+def collect_mlp_oof_probabilities(
+    train_features,
+    y_true,
+    sample_weights,
+    config,
+    *,
+    random_seeds,
+):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
+
+    for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(train_features[tr_idx])
+        X_val = scaler.transform(train_features[val_idx])
+        fold_proba = np.zeros((len(val_idx), len(LABEL_ORDER)), dtype=np.float32)
+
+        for random_seed in random_seeds:
+            model = MLPClassifier(
+                hidden_layer_sizes=config["hidden_layer_sizes"],
+                alpha=config["alpha"],
+                learning_rate_init=config["learning_rate_init"],
+                batch_size=4096,
+                early_stopping=True,
+                max_iter=80,
+                n_iter_no_change=10,
+                random_state=random_seed,
+            )
+            model.fit(X_tr, y_true[tr_idx], sample_weight=sample_weights[tr_idx])
+            fold_proba += model.predict_proba(X_val) / len(random_seeds)
+
+        oof_proba[val_idx] = fold_proba
+
+    return oof_proba
+
+
+def train_mlp_test_probabilities(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    config,
+    *,
+    random_seeds,
+):
+    scaler = StandardScaler()
+    train_scaled = scaler.fit_transform(train_features)
+    test_scaled = scaler.transform(test_features)
+    test_proba = np.zeros((len(test_features), len(LABEL_ORDER)), dtype=np.float32)
+
+    for random_seed in random_seeds:
+        full_model = MLPClassifier(
+            hidden_layer_sizes=config["hidden_layer_sizes"],
+            alpha=config["alpha"],
+            learning_rate_init=config["learning_rate_init"],
+            batch_size=4096,
+            early_stopping=True,
+            max_iter=80,
+            n_iter_no_change=10,
+            random_state=random_seed,
+        )
+        full_model.fit(train_scaled, y_true, sample_weight=sample_weights)
+        test_proba += full_model.predict_proba(test_scaled) / len(random_seeds)
+
+    return test_proba
+
+
+def predict_torch_probabilities(model, features, batch_size=16384):
+    device = next(model.parameters()).device
+    model.eval()
+    prob_batches = []
+
+    with torch.no_grad():
+        for start in range(0, len(features), batch_size):
+            batch_features = torch.from_numpy(
+                features[start:start + batch_size].astype(np.float32, copy=False)
+            ).to(device)
+            logits = model(batch_features)
+            prob_batches.append(torch.softmax(logits, dim=1).cpu().numpy())
+
+    return np.vstack(prob_batches)
+
+
+def fit_torch_model(
+    model,
+    train_features,
+    train_labels,
+    train_weights,
+    val_features,
+    val_labels,
+    config,
+):
+    torch.manual_seed(SEED)
+    device = torch.device("cpu")
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+    )
+    loss_fn = nn.CrossEntropyLoss(reduction="none")
+
+    train_dataset = TensorDataset(
+        torch.from_numpy(train_features.astype(np.float32, copy=False)),
+        torch.from_numpy(train_labels.astype(np.int64, copy=False)),
+        torch.from_numpy(train_weights.astype(np.float32, copy=False)),
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        drop_last=False,
+    )
+
+    best_score = -1.0
+    best_epoch = 0
+    best_state = None
+    patience = 0
+
+    for epoch in range(1, config["max_epochs"] + 1):
+        model.train()
+        for batch_x, batch_y, batch_w in train_loader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            batch_w = batch_w.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(batch_x)
+            loss = (loss_fn(logits, batch_y) * batch_w).mean()
+            loss.backward()
+            optimizer.step()
+
+        val_proba = predict_torch_probabilities(model, val_features)
+        score = balanced_accuracy_score(val_labels, np.argmax(val_proba, axis=1))
+
+        if score > best_score + 1e-12:
+            best_score = score
+            best_epoch = epoch
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            patience = 0
+        else:
+            patience += 1
+            if patience >= config["patience"]:
+                break
+
+    model.load_state_dict(best_state)
+    return model, best_score, best_epoch
+
+
+def train_full_torch_model(
+    model,
+    train_features,
+    train_labels,
+    train_weights,
+    config,
+    epochs,
+):
+    torch.manual_seed(SEED)
+    device = torch.device("cpu")
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+    )
+    loss_fn = nn.CrossEntropyLoss(reduction="none")
+
+    train_dataset = TensorDataset(
+        torch.from_numpy(train_features.astype(np.float32, copy=False)),
+        torch.from_numpy(train_labels.astype(np.int64, copy=False)),
+        torch.from_numpy(train_weights.astype(np.float32, copy=False)),
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        drop_last=False,
+    )
+
+    for _ in range(epochs):
+        model.train()
+        for batch_x, batch_y, batch_w in train_loader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            batch_w = batch_w.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(batch_x)
+            loss = (loss_fn(logits, batch_y) * batch_w).mean()
+            loss.backward()
+            optimizer.step()
+
+    return model
+
+
+def collect_torch_oof_probabilities(
+    train_features,
+    y_true,
+    sample_weights,
+    config,
+    model_builder,
+):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
+    fold_epochs = []
+
+    for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(train_features[tr_idx]).astype(np.float32)
+        X_val = scaler.transform(train_features[val_idx]).astype(np.float32)
+
+        model, _, best_epoch = fit_torch_model(
+            model_builder(X_tr.shape[1], config),
+            X_tr,
+            y_true[tr_idx],
+            sample_weights[tr_idx],
+            X_val,
+            y_true[val_idx],
+            config,
+        )
+        oof_proba[val_idx] = predict_torch_probabilities(model, X_val)
+        fold_epochs.append(best_epoch)
+
+    return oof_proba, fold_epochs
+
+
+def train_torch_test_probabilities(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    config,
+    model_builder,
+    fold_epochs,
+):
+    scaler = StandardScaler()
+    train_scaled = scaler.fit_transform(train_features).astype(np.float32)
+    test_scaled = scaler.transform(test_features).astype(np.float32)
+    full_epochs = max(1, int(round(np.mean(fold_epochs))))
+    full_model = train_full_torch_model(
+        model_builder(train_scaled.shape[1], config),
+        train_scaled,
+        y_true,
+        sample_weights,
+        config,
+        full_epochs,
+    )
+    return predict_torch_probabilities(full_model, test_scaled)
+
+
+def run_torch_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    *,
+    candidate_configs,
+    model_builder,
+    config_formatter,
+    label,
+    apply_class_scale_search=False,
+):
+    best_score = -1.0
+    best_pred = None
+    best_config = None
+    best_class_scales = (1.0, 1.0, 1.0)
+    best_epochs = []
+
+    for config in candidate_configs:
+        oof_proba, fold_epochs = collect_torch_oof_probabilities(
+            train_features,
+            y_true,
+            sample_weights,
+            config,
+            model_builder,
+        )
+
+        score, oof_pred, class_scales = evaluate_probability_policy(
+            oof_proba,
+            y_true,
+            apply_class_scale_search,
+        )
+        if score > best_score:
+            best_score = score
+            best_pred = oof_pred
+            best_config = config
+            best_class_scales = class_scales
+            best_epochs = fold_epochs
+
+    print(f"Best {label} config — {config_formatter(best_config)}")
+    print_class_scale_summary(f"Best {label} stack class scales", best_class_scales)
+
+    test_proba = train_torch_test_probabilities(
+        train_features,
+        y_true,
+        test_features,
+        sample_weights,
+        best_config,
+        model_builder,
+        best_epochs,
+    )
+    final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
+
+    return best_score, best_pred, final_test_pred
+
+
+class FTTransformerStacker(nn.Module):
+    def __init__(self, n_features, d_token, n_heads, n_layers, dropout):
+        super().__init__()
+        self.feature_weight = nn.Parameter(torch.randn(n_features, d_token) * 0.02)
+        self.feature_bias = nn.Parameter(torch.zeros(n_features, d_token))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_token))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_token,
+            nhead=n_heads,
+            dim_feedforward=d_token * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_token),
+            nn.Linear(d_token, d_token),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_token, len(LABEL_ORDER)),
+        )
+
+    def forward(self, x):
+        tokens = (
+            x.unsqueeze(-1) * self.feature_weight.unsqueeze(0)
+            + self.feature_bias.unsqueeze(0)
+        )
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        encoded = self.encoder(torch.cat([cls, tokens], dim=1))
+        return self.head(encoded[:, 0])
+
+
+class CNNStacker(nn.Module):
+    def __init__(self, n_features, channels, kernel_size, dropout):
+        super().__init__()
+        padding = kernel_size // 2
+        self.backbone = nn.Sequential(
+            nn.Conv1d(1, channels, kernel_size=kernel_size, padding=padding),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(4),
+            nn.Flatten(),
+            nn.Linear(channels * 4, channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(channels, len(LABEL_ORDER)),
+        )
+
+    def forward(self, x):
+        encoded = self.backbone(x.unsqueeze(1))
+        return self.head(encoded)
+
+
+class RNNStacker(nn.Module):
+    def __init__(self, n_features, d_token, hidden_size, n_layers, dropout):
+        super().__init__()
+        self.feature_projection = nn.Linear(1, d_token)
+        self.sequence_bias = nn.Parameter(torch.zeros(1, n_features, d_token))
+        self.encoder = nn.GRU(
+            input_size=d_token,
+            hidden_size=hidden_size,
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout if n_layers > 1 else 0.0,
+            bidirectional=True,
+        )
+        pooled_width = hidden_size * 4
+        self.head = nn.Sequential(
+            nn.LayerNorm(pooled_width),
+            nn.Linear(pooled_width, hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 2, len(LABEL_ORDER)),
+        )
+
+    def forward(self, x):
+        tokens = self.feature_projection(x.unsqueeze(-1)) + self.sequence_bias[:, : x.size(1)]
+        encoded, _ = self.encoder(tokens)
+        pooled = torch.cat([encoded.mean(dim=1), encoded.max(dim=1).values], dim=1)
+        return self.head(pooled)
+
+
+def run_ft_transformer_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
+    candidate_configs = [
+        {
+            "d_token": 16,
+            "n_heads": 4,
+            "n_layers": 2,
+            "dropout": 0.10,
+            "learning_rate": 3e-4,
+            "weight_decay": 1e-4,
+            "batch_size": 4096,
+            "max_epochs": 18,
+            "patience": 4,
+        },
+        {
+            "d_token": 24,
+            "n_heads": 4,
+            "n_layers": 2,
+            "dropout": 0.10,
+            "learning_rate": 2e-4,
+            "weight_decay": 2e-4,
+            "batch_size": 4096,
+            "max_epochs": 20,
+            "patience": 4,
+        },
+    ]
+    return run_torch_stack(
+        train_features,
+        y_true,
+        test_features,
+        sample_weights,
+        candidate_configs=candidate_configs,
+        model_builder=lambda n_features, config: FTTransformerStacker(
+            n_features=n_features,
+            d_token=config["d_token"],
+            n_heads=config["n_heads"],
+            n_layers=config["n_layers"],
+            dropout=config["dropout"],
+        ),
+        config_formatter=lambda config: (
+            f"d_token:{config['d_token']} "
+            f"layers:{config['n_layers']} "
+            f"heads:{config['n_heads']} "
+            f"dropout:{config['dropout']:.2f} "
+            f"lr:{config['learning_rate']:.5f}"
+        ),
+        label="ft-transformer",
+        apply_class_scale_search=apply_class_scale_search,
+    )
+
+
+def run_cnn_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
+    candidate_configs = [
+        {
+            "channels": 32,
+            "kernel_size": 3,
+            "dropout": 0.10,
+            "learning_rate": 4e-4,
+            "weight_decay": 1e-4,
+            "batch_size": 4096,
+            "max_epochs": 18,
+            "patience": 4,
+        },
+        {
+            "channels": 48,
+            "kernel_size": 5,
+            "dropout": 0.15,
+            "learning_rate": 3e-4,
+            "weight_decay": 2e-4,
+            "batch_size": 4096,
+            "max_epochs": 20,
+            "patience": 4,
+        },
+    ]
+    return run_torch_stack(
+        train_features,
+        y_true,
+        test_features,
+        sample_weights,
+        candidate_configs=candidate_configs,
+        model_builder=lambda n_features, config: CNNStacker(
+            n_features=n_features,
+            channels=config["channels"],
+            kernel_size=config["kernel_size"],
+            dropout=config["dropout"],
+        ),
+        config_formatter=lambda config: (
+            f"channels:{config['channels']} "
+            f"kernel:{config['kernel_size']} "
+            f"dropout:{config['dropout']:.2f} "
+            f"lr:{config['learning_rate']:.5f}"
+        ),
+        label="cnn",
+        apply_class_scale_search=apply_class_scale_search,
+    )
+
+
+def run_rnn_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
+    candidate_configs = [
+        {
+            "d_token": 16,
+            "hidden_size": 48,
+            "n_layers": 1,
+            "dropout": 0.10,
+            "learning_rate": 5e-4,
+            "weight_decay": 1e-4,
+            "batch_size": 4096,
+            "max_epochs": 18,
+            "patience": 4,
+        },
+        {
+            "d_token": 24,
+            "hidden_size": 64,
+            "n_layers": 2,
+            "dropout": 0.15,
+            "learning_rate": 4e-4,
+            "weight_decay": 2e-4,
+            "batch_size": 4096,
+            "max_epochs": 20,
+            "patience": 4,
+        },
+    ]
+    return run_torch_stack(
+        train_features,
+        y_true,
+        test_features,
+        sample_weights,
+        candidate_configs=candidate_configs,
+        model_builder=lambda n_features, config: RNNStacker(
+            n_features=n_features,
+            d_token=config["d_token"],
+            hidden_size=config["hidden_size"],
+            n_layers=config["n_layers"],
+            dropout=config["dropout"],
+        ),
+        config_formatter=lambda config: (
+            f"d_token:{config['d_token']} "
+            f"hidden:{config['hidden_size']} "
+            f"layers:{config['n_layers']} "
+            f"dropout:{config['dropout']:.2f} "
+            f"lr:{config['learning_rate']:.5f}"
+        ),
+        label="rnn",
+        apply_class_scale_search=apply_class_scale_search,
+    )
+
+
+def build_tabnet_classifier(input_dim, config, seed):
+    return TabNetClassifier(
+        input_dim=input_dim,
+        output_dim=len(LABEL_ORDER),
+        n_d=config["n_d"],
+        n_a=config["n_d"],
+        n_steps=config["n_steps"],
+        gamma=config["gamma"],
+        lambda_sparse=config["lambda_sparse"],
+        n_independent=2,
+        n_shared=2,
+        seed=seed,
+        verbose=0,
+        device_name="cpu",
+        optimizer_fn=torch.optim.Adam,
+        optimizer_params={"lr": config["learning_rate"]},
+        mask_type=config.get("mask_type", "sparsemax"),
+    )
+
+
+def collect_tabnet_oof_probabilities(train_features, y_true, sample_weights, config):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
+    fold_epochs = []
+
+    for fold_idx, (tr_idx, val_idx) in enumerate(meta_skf.split(train_features, y_true)):
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(train_features[tr_idx]).astype(np.float32)
+        X_val = scaler.transform(train_features[val_idx]).astype(np.float32)
+        model = build_tabnet_classifier(X_tr.shape[1], config, SEED + fold_idx)
+        model.fit(
+            X_tr,
+            y_true[tr_idx],
+            eval_set=[(X_val, y_true[val_idx])],
+            eval_name=["val"],
+            eval_metric=["logloss"],
+            weights=sample_weights[tr_idx].astype(np.float32),
+            max_epochs=config["max_epochs"],
+            patience=config["patience"],
+            batch_size=config["batch_size"],
+            virtual_batch_size=config["virtual_batch_size"],
+            num_workers=0,
+            drop_last=False,
+            pin_memory=False,
+        )
+        oof_proba[val_idx] = model.predict_proba(X_val).astype(np.float32)
+        fold_epochs.append(int(getattr(model, "best_epoch", config["max_epochs"])))
+
+    return oof_proba, fold_epochs
+
+
+def train_tabnet_test_probabilities(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    config,
+    fold_epochs,
+):
+    scaler = StandardScaler()
+    train_scaled = scaler.fit_transform(train_features).astype(np.float32)
+    test_scaled = scaler.transform(test_features).astype(np.float32)
+    full_epochs = max(5, int(round(np.mean(fold_epochs))))
+    model = build_tabnet_classifier(train_scaled.shape[1], config, SEED)
+    model.fit(
+        train_scaled,
+        y_true,
+        weights=sample_weights.astype(np.float32),
+        max_epochs=full_epochs,
+        batch_size=config["batch_size"],
+        virtual_batch_size=config["virtual_batch_size"],
+        num_workers=0,
+        drop_last=False,
+        pin_memory=False,
+    )
+    return model.predict_proba(test_scaled).astype(np.float32)
+
+
+def run_tabnet_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
+    candidate_configs = [
+        {
+            "n_d": 16,
+            "n_steps": 4,
+            "gamma": 1.3,
+            "lambda_sparse": 1e-4,
+            "learning_rate": 2e-2,
+            "batch_size": 8192,
+            "virtual_batch_size": 1024,
+            "max_epochs": 25,
+            "patience": 5,
+            "mask_type": "sparsemax",
+        },
+        {
+            "n_d": 24,
+            "n_steps": 5,
+            "gamma": 1.5,
+            "lambda_sparse": 5e-5,
+            "learning_rate": 1.5e-2,
+            "batch_size": 8192,
+            "virtual_batch_size": 1024,
+            "max_epochs": 30,
+            "patience": 6,
+            "mask_type": "entmax",
+        },
+    ]
+
+    best_score = -1.0
+    best_pred = None
+    best_config = None
+    best_class_scales = (1.0, 1.0, 1.0)
+    best_epochs = []
+
+    for config in candidate_configs:
+        oof_proba, fold_epochs = collect_tabnet_oof_probabilities(
+            train_features,
+            y_true,
+            sample_weights,
+            config,
+        )
+        score, oof_pred, class_scales = evaluate_probability_policy(
+            oof_proba,
+            y_true,
+            apply_class_scale_search,
+        )
+        if score > best_score:
+            best_score = score
+            best_pred = oof_pred
+            best_config = config
+            best_class_scales = class_scales
+            best_epochs = fold_epochs
+
+    print(
+        "Best tabnet stack config — "
+        f"n_d:{best_config['n_d']} "
+        f"steps:{best_config['n_steps']} "
+        f"gamma:{best_config['gamma']:.2f} "
+        f"mask:{best_config['mask_type']} "
+        f"lr:{best_config['learning_rate']:.4f}"
+    )
+    print_class_scale_summary("Best tabnet stack class scales", best_class_scales)
+
+    test_proba = train_tabnet_test_probabilities(
+        train_features,
+        y_true,
+        test_features,
+        sample_weights,
+        best_config,
+        best_epochs,
+    )
+    final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
+    return best_score, best_pred, final_test_pred
+
+
+def search_two_model_blend(prob_a, prob_b, y_true, apply_class_scale_search):
+    best_score = -1.0
+    best_weight = 0.50
+    best_pred = None
+    best_class_scales = (1.0, 1.0, 1.0)
+
+    for weight in np.arange(0.20, 0.81, 0.05):
+        blended = weight * prob_a + (1.0 - weight) * prob_b
+        score, pred, class_scales = evaluate_probability_policy(
+            blended,
+            y_true,
+            apply_class_scale_search,
+        )
+        if score > best_score:
+            best_score = score
+            best_weight = float(round(weight, 3))
+            best_pred = pred
+            best_class_scales = class_scales
+
+    for weight in np.arange(best_weight - 0.08, best_weight + 0.081, 0.01):
+        if weight <= 0.05 or weight >= 0.95:
+            continue
+        blended = weight * prob_a + (1.0 - weight) * prob_b
+        score, pred, class_scales = evaluate_probability_policy(
+            blended,
+            y_true,
+            apply_class_scale_search,
+        )
+        if score > best_score:
+            best_score = score
+            best_weight = float(round(weight, 3))
+            best_pred = pred
+            best_class_scales = class_scales
+
+    return best_score, best_weight, best_pred, best_class_scales
+
+
+def run_ann_cnn_combo_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
+    mlp_candidates = [
+        {"hidden_layer_sizes": (128, 64), "alpha": 5e-4, "learning_rate_init": 1e-3},
+        {"hidden_layer_sizes": (192, 96, 32), "alpha": 5e-4, "learning_rate_init": 5e-4},
+    ]
+    cnn_candidates = [
+        {
+            "channels": 32,
+            "kernel_size": 3,
+            "dropout": 0.10,
+            "learning_rate": 4e-4,
+            "weight_decay": 1e-4,
+            "batch_size": 4096,
+            "max_epochs": 18,
+            "patience": 4,
+        },
+        {
+            "channels": 48,
+            "kernel_size": 5,
+            "dropout": 0.15,
+            "learning_rate": 3e-4,
+            "weight_decay": 2e-4,
+            "batch_size": 4096,
+            "max_epochs": 20,
+            "patience": 4,
+        },
+    ]
+
+    ann_bank = []
+    for config in mlp_candidates:
+        ann_bank.append(
+            {
+                "config": config,
+                "oof": collect_mlp_oof_probabilities(
+                    train_features,
+                    y_true,
+                    sample_weights,
+                    config,
+                    random_seeds=[SEED],
+                ),
+            }
+        )
+
+    cnn_bank = []
+    for config in cnn_candidates:
+        oof_proba, fold_epochs = collect_torch_oof_probabilities(
+            train_features,
+            y_true,
+            sample_weights,
+            config,
+            lambda n_features, cfg: CNNStacker(
+                n_features=n_features,
+                channels=cfg["channels"],
+                kernel_size=cfg["kernel_size"],
+                dropout=cfg["dropout"],
+            ),
+        )
+        cnn_bank.append({"config": config, "oof": oof_proba, "fold_epochs": fold_epochs})
+
+    best_score = -1.0
+    best_pred = None
+    best_class_scales = (1.0, 1.0, 1.0)
+    best_ann = None
+    best_cnn = None
+    best_weight = 0.50
+
+    for ann_item in ann_bank:
+        for cnn_item in cnn_bank:
+            score, weight, pred, class_scales = search_two_model_blend(
+                ann_item["oof"],
+                cnn_item["oof"],
+                y_true,
+                apply_class_scale_search,
+            )
+            if score > best_score:
+                best_score = score
+                best_weight = weight
+                best_pred = pred
+                best_class_scales = class_scales
+                best_ann = ann_item
+                best_cnn = cnn_item
+
+    print(
+        "Best ann+cnn combo ANN config — "
+        f"hidden:{best_ann['config']['hidden_layer_sizes']} "
+        f"alpha:{best_ann['config']['alpha']:.5f} "
+        f"lr:{best_ann['config']['learning_rate_init']:.5f}"
+    )
+    print(
+        "Best ann+cnn combo CNN config — "
+        f"channels:{best_cnn['config']['channels']} "
+        f"kernel:{best_cnn['config']['kernel_size']} "
+        f"dropout:{best_cnn['config']['dropout']:.2f} "
+        f"lr:{best_cnn['config']['learning_rate']:.5f}"
+    )
+    print(
+        f"Best ann+cnn blend weight — ANN:{best_weight:.2f}  CNN:{1.0 - best_weight:.2f}"
+    )
+    print_class_scale_summary("Best ann+cnn combo class scales", best_class_scales)
+
+    ann_test = train_mlp_test_probabilities(
+        train_features,
+        y_true,
+        test_features,
+        sample_weights,
+        best_ann["config"],
+        random_seeds=[SEED],
+    )
+    cnn_test = train_torch_test_probabilities(
+        train_features,
+        y_true,
+        test_features,
+        sample_weights,
+        best_cnn["config"],
+        lambda n_features, cfg: CNNStacker(
+            n_features=n_features,
+            channels=cfg["channels"],
+            kernel_size=cfg["kernel_size"],
+            dropout=cfg["dropout"],
+        ),
+        best_cnn["fold_epochs"],
+    )
+    test_proba = best_weight * ann_test + (1.0 - best_weight) * cnn_test
+    final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
+    return best_score, best_pred, final_test_pred
+
+
+def search_base_neural_combo(
+    base_prob_matrices,
+    ann_prob,
+    cnn_prob,
+    base_weights,
+    y_true,
+    apply_class_scale_search,
+):
+    all_probabilities = list(base_prob_matrices) + [ann_prob, cnn_prob]
+    best_score = -1.0
+    best_pred = None
+    best_class_scales = (1.0, 1.0, 1.0)
+    best_combo = None
+
+    for ann_weight in np.arange(0.00, 0.31, 0.05):
+        for cnn_weight in np.arange(0.00, 0.31, 0.05):
+            if ann_weight + cnn_weight >= 0.60:
+                continue
+            base_scale = 1.0 - ann_weight - cnn_weight
+            weights = [base_scale * weight for weight in base_weights] + [ann_weight, cnn_weight]
+            blended = blend_probabilities(all_probabilities, weights)
+            score, pred, class_scales = evaluate_probability_policy(
+                blended,
+                y_true,
+                apply_class_scale_search,
+            )
+            if score > best_score:
+                best_score = score
+                best_pred = pred
+                best_class_scales = class_scales
+                best_combo = weights
+
+    for ann_weight in np.arange(best_combo[3] - 0.05, best_combo[3] + 0.051, 0.01):
+        for cnn_weight in np.arange(best_combo[4] - 0.05, best_combo[4] + 0.051, 0.01):
+            if ann_weight < 0.0 or cnn_weight < 0.0 or ann_weight + cnn_weight >= 0.70:
+                continue
+            base_scale = 1.0 - ann_weight - cnn_weight
+            if base_scale <= 0.0:
+                continue
+            weights = [base_scale * weight for weight in base_weights] + [
+                float(round(ann_weight, 3)),
+                float(round(cnn_weight, 3)),
+            ]
+            blended = blend_probabilities(all_probabilities, weights)
+            score, pred, class_scales = evaluate_probability_policy(
+                blended,
+                y_true,
+                apply_class_scale_search,
+            )
+            if score > best_score:
+                best_score = score
+                best_pred = pred
+                best_class_scales = class_scales
+                best_combo = weights
+
+    return best_score, best_combo, best_pred, best_class_scales
+
+
+def run_neural_base_blend_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    prob_matrices_oof,
+    prob_matrices_test,
+    base_weights,
+    apply_class_scale_search=False,
+):
+    ann_config = {
+        "hidden_layer_sizes": (128, 64),
+        "alpha": 5e-4,
+        "learning_rate_init": 1e-3,
+    }
+    cnn_candidates = [
+        {
+            "channels": 32,
+            "kernel_size": 3,
+            "dropout": 0.10,
+            "learning_rate": 4e-4,
+            "weight_decay": 1e-4,
+            "batch_size": 4096,
+            "max_epochs": 18,
+            "patience": 4,
+        },
+        {
+            "channels": 48,
+            "kernel_size": 5,
+            "dropout": 0.15,
+            "learning_rate": 3e-4,
+            "weight_decay": 2e-4,
+            "batch_size": 4096,
+            "max_epochs": 20,
+            "patience": 4,
+        },
+    ]
+
+    ann_oof = collect_mlp_oof_probabilities(
+        train_features,
+        y_true,
+        sample_weights,
+        ann_config,
+        random_seeds=[SEED],
+    )
+
+    best_score = -1.0
+    best_pred = None
+    best_class_scales = (1.0, 1.0, 1.0)
+    best_combo = None
+    best_cnn = None
+
+    for cnn_config in cnn_candidates:
+        cnn_oof, fold_epochs = collect_torch_oof_probabilities(
+            train_features,
+            y_true,
+            sample_weights,
+            cnn_config,
+            lambda n_features, cfg: CNNStacker(
+                n_features=n_features,
+                channels=cfg["channels"],
+                kernel_size=cfg["kernel_size"],
+                dropout=cfg["dropout"],
+            ),
+        )
+        score, combo, pred, class_scales = search_base_neural_combo(
+            prob_matrices_oof,
+            ann_oof,
+            cnn_oof,
+            base_weights,
+            y_true,
+            apply_class_scale_search,
+        )
+        if score > best_score:
+            best_score = score
+            best_pred = pred
+            best_class_scales = class_scales
+            best_combo = combo
+            best_cnn = {"config": cnn_config, "fold_epochs": fold_epochs}
+
+    print(
+        "Best neural-base ANN config — "
+        f"hidden:{ann_config['hidden_layer_sizes']} "
+        f"alpha:{ann_config['alpha']:.5f} "
+        f"lr:{ann_config['learning_rate_init']:.5f}"
+    )
+    print(
+        "Best neural-base CNN config — "
+        f"channels:{best_cnn['config']['channels']} "
+        f"kernel:{best_cnn['config']['kernel_size']} "
+        f"dropout:{best_cnn['config']['dropout']:.2f} "
+        f"lr:{best_cnn['config']['learning_rate']:.5f}"
+    )
+    print(
+        "Best neural-base blend weights — "
+        f"LGB:{best_combo[0]:.2f}  XGB:{best_combo[1]:.2f}  CAT:{best_combo[2]:.2f}  "
+        f"ANN:{best_combo[3]:.2f}  CNN:{best_combo[4]:.2f}"
+    )
+    print_class_scale_summary("Best neural-base blend class scales", best_class_scales)
+
+    ann_test = train_mlp_test_probabilities(
+        train_features,
+        y_true,
+        test_features,
+        sample_weights,
+        ann_config,
+        random_seeds=[SEED],
+    )
+    cnn_test = train_torch_test_probabilities(
+        train_features,
+        y_true,
+        test_features,
+        sample_weights,
+        best_cnn["config"],
+        lambda n_features, cfg: CNNStacker(
+            n_features=n_features,
+            channels=cfg["channels"],
+            kernel_size=cfg["kernel_size"],
+            dropout=cfg["dropout"],
+        ),
+        best_cnn["fold_epochs"],
+    )
+    test_blend = blend_probabilities(
+        list(prob_matrices_test) + [ann_test, cnn_test],
+        best_combo,
+    )
+    final_test_pred = predict_with_class_scales(test_blend, best_class_scales)
+    return best_score, best_pred, final_test_pred
+
+
+def run_xgb_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
     meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     candidate_configs = [
         {
@@ -771,9 +2100,10 @@ def run_xgb_stack(train_features, y_true, test_features, sample_weights):
     best_score = -1.0
     best_pred = None
     best_config = None
+    best_class_scales = (1.0, 1.0, 1.0)
 
     for config in candidate_configs:
-        oof_pred = np.zeros(len(y_true), dtype=int)
+        oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
         for tr_idx, val_idx in meta_skf.split(train_features, y_true):
             model = xgb.XGBClassifier(
                 objective="multi:softprob",
@@ -800,13 +2130,18 @@ def run_xgb_stack(train_features, y_true, test_features, sample_weights):
                 eval_set=[(train_features[val_idx], y_true[val_idx])],
                 verbose=False,
             )
-            oof_pred[val_idx] = model.predict(train_features[val_idx])
+            oof_proba[val_idx] = model.predict_proba(train_features[val_idx])
 
-        score = balanced_accuracy_score(y_true, oof_pred)
+        score, oof_pred, class_scales = evaluate_probability_policy(
+            oof_proba,
+            y_true,
+            apply_class_scale_search,
+        )
         if score > best_score:
             best_score = score
             best_pred = oof_pred
             best_config = config
+            best_class_scales = class_scales
 
     print(
         "Best xgb stack config — "
@@ -815,6 +2150,7 @@ def run_xgb_stack(train_features, y_true, test_features, sample_weights):
         f"subsample:{best_config['subsample']:.2f} "
         f"colsample:{best_config['colsample_bytree']:.2f}"
     )
+    print_class_scale_summary("Best xgb stack class scales", best_class_scales)
 
     full_model = xgb.XGBClassifier(
         objective="multi:softprob",
@@ -834,12 +2170,19 @@ def run_xgb_stack(train_features, y_true, test_features, sample_weights):
         verbosity=0,
     )
     full_model.fit(train_features, y_true, sample_weight=sample_weights)
-    final_test_pred = full_model.predict(test_features)
+    test_proba = full_model.predict_proba(test_features)
+    final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
 
     return best_score, best_pred, final_test_pred
 
 
-def run_hgb_stack(train_features, y_true, test_features, sample_weights):
+def run_hgb_stack(
+    train_features,
+    y_true,
+    test_features,
+    sample_weights,
+    apply_class_scale_search=False,
+):
     meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     candidate_configs = [
         {
@@ -861,9 +2204,10 @@ def run_hgb_stack(train_features, y_true, test_features, sample_weights):
     best_score = -1.0
     best_pred = None
     best_config = None
+    best_class_scales = (1.0, 1.0, 1.0)
 
     for config in candidate_configs:
-        oof_pred = np.zeros(len(y_true), dtype=int)
+        oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
         for tr_idx, val_idx in meta_skf.split(train_features, y_true):
             model = HistGradientBoostingClassifier(
                 learning_rate=config["learning_rate"],
@@ -880,13 +2224,18 @@ def run_hgb_stack(train_features, y_true, test_features, sample_weights):
                 y_true[tr_idx],
                 sample_weight=sample_weights[tr_idx],
             )
-            oof_pred[val_idx] = model.predict(train_features[val_idx])
+            oof_proba[val_idx] = model.predict_proba(train_features[val_idx])
 
-        score = balanced_accuracy_score(y_true, oof_pred)
+        score, oof_pred, class_scales = evaluate_probability_policy(
+            oof_proba,
+            y_true,
+            apply_class_scale_search,
+        )
         if score > best_score:
             best_score = score
             best_pred = oof_pred
             best_config = config
+            best_class_scales = class_scales
 
     print(
         "Best hgb stack config — "
@@ -895,6 +2244,7 @@ def run_hgb_stack(train_features, y_true, test_features, sample_weights):
         f"min_samples_leaf:{best_config['min_samples_leaf']} "
         f"l2:{best_config['l2_regularization']:.2f}"
     )
+    print_class_scale_summary("Best hgb stack class scales", best_class_scales)
 
     full_model = HistGradientBoostingClassifier(
         learning_rate=best_config["learning_rate"],
@@ -907,7 +2257,8 @@ def run_hgb_stack(train_features, y_true, test_features, sample_weights):
         random_state=SEED,
     )
     full_model.fit(train_features, y_true, sample_weight=sample_weights)
-    final_test_pred = full_model.predict(test_features)
+    test_proba = full_model.predict_proba(test_features)
+    final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
 
     return best_score, best_pred, final_test_pred
 
@@ -1063,6 +2414,13 @@ meta_test_full = None
 if ARGS.meta_full_features and ARGS.decision_policy in {
     "logreg_stack",
     "mlp_stack",
+    "mlp_bag_stack",
+    "tabnet_stack",
+    "ann_cnn_combo_stack",
+    "neural_base_blend_stack",
+    "ft_transformer_stack",
+    "cnn_stack",
+    "rnn_stack",
     "xgb_stack",
     "hgb_stack",
     "ordinal_xgb_stack",
@@ -1312,9 +2670,33 @@ if ARGS.decision_policy == "class_scale_search":
         blend_probabilities(prob_matrices_test, best_w),
         class_scales,
     )
+elif ARGS.decision_policy == "model_scale_search":
+    best_ba, model_class_scales, class_scales, ensemble_oof_pred = search_model_class_scales(
+        prob_matrices_oof,
+        best_w,
+        y,
+    )
+    for model_label, scales in zip(MODEL_LABELS, model_class_scales):
+        print(
+            f"Best model scales [{model_label}] — "
+            f"Low:{scales[0]:.2f}  Medium:{scales[1]:.2f}  High:{scales[2]:.2f}"
+        )
+    print(
+        f"Final class scales — Low:{class_scales[0]:.2f}  "
+        f"Medium:{class_scales[1]:.2f}  High:{class_scales[2]:.2f}"
+    )
+    scaled_test_blend = build_model_scaled_blend(prob_matrices_test, best_w, model_class_scales)
+    test_pred_idx = predict_with_class_scales(scaled_test_blend, class_scales)
 elif ARGS.decision_policy in {
     "logreg_stack",
     "mlp_stack",
+    "mlp_bag_stack",
+    "tabnet_stack",
+    "ann_cnn_combo_stack",
+    "neural_base_blend_stack",
+    "ft_transformer_stack",
+    "cnn_stack",
+    "rnn_stack",
     "xgb_stack",
     "hgb_stack",
     "ordinal_xgb_stack",
@@ -1334,6 +2716,7 @@ elif ARGS.decision_policy in {
             y,
             stack_test,
             sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
         )
         print("Meta-model: multinomial logistic regression on cached OOF probabilities")
     elif ARGS.decision_policy == "mlp_stack":
@@ -1342,14 +2725,82 @@ elif ARGS.decision_policy in {
             y,
             stack_test,
             sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
         )
         print("Meta-model: ANN stacker on cached OOF probabilities")
+    elif ARGS.decision_policy == "mlp_bag_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_mlp_bag_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
+        )
+        print("Meta-model: seed-bagged ANN stacker on cached OOF probabilities")
+    elif ARGS.decision_policy == "tabnet_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_tabnet_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
+        )
+        print("Meta-model: TabNet stacker on cached OOF probabilities")
+    elif ARGS.decision_policy == "ann_cnn_combo_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_ann_cnn_combo_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
+        )
+        print("Meta-model: ANN+CNN combo stacker on cached OOF probabilities")
+    elif ARGS.decision_policy == "neural_base_blend_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_neural_base_blend_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+            prob_matrices_oof,
+            prob_matrices_test,
+            best_w,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
+        )
+        print("Meta-model: ANN+CNN+tree blend on cached OOF probabilities")
+    elif ARGS.decision_policy == "ft_transformer_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_ft_transformer_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
+        )
+        print("Meta-model: FT-transformer stacker on cached OOF probabilities")
+    elif ARGS.decision_policy == "cnn_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_cnn_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
+        )
+        print("Meta-model: CNN stacker on cached OOF probabilities")
+    elif ARGS.decision_policy == "rnn_stack":
+        best_ba, ensemble_oof_pred, test_pred_idx = run_rnn_stack(
+            stack_train,
+            y,
+            stack_test,
+            sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
+        )
+        print("Meta-model: GRU-based RNN stacker on cached OOF probabilities")
     elif ARGS.decision_policy == "xgb_stack":
         best_ba, ensemble_oof_pred, test_pred_idx = run_xgb_stack(
             stack_train,
             y,
             stack_test,
             sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
         )
         print("Meta-model: XGBoost stacker on cached OOF probabilities")
     elif ARGS.decision_policy == "hgb_stack":
@@ -1358,6 +2809,7 @@ elif ARGS.decision_policy in {
             y,
             stack_test,
             sample_weights,
+            apply_class_scale_search=ARGS.stack_class_scale_search,
         )
         print("Meta-model: HistGradientBoosting stacker on cached OOF probabilities")
     elif ARGS.decision_policy == "ordinal_xgb_stack":

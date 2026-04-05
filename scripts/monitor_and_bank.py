@@ -183,6 +183,28 @@ EXPERIMENTS = [
         feature_config="stress buckets + risk flags + categorical crosses + cached ensemble probabilities",
     ),
     Experiment(
+        run_name="stress_signals_model_scale_v1",
+        log_path=ROOT / "stress_signals_model_scale.log",
+        run_args=[
+            "--run-name",
+            "stress_signals_model_scale_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "model_scale_search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we let each base model keep its own High and Medium probability correction before blending, "
+            "balanced accuracy should improve because LightGBM, XGBoost, and CatBoost make different "
+            "calibration mistakes that one global class scale cannot fix."
+        ),
+        model_config="stress-feature lgb+xgb+cat blend with per-model class-scale search and final class-scale tuning",
+        feature_config="stress buckets + risk flags + categorical crosses + cached ensemble probabilities with per-model class calibration",
+    ),
+    Experiment(
         run_name="stress_signals_ann_stack_v1",
         log_path=ROOT / "stress_signals_ann_stack.log",
         run_args=[
@@ -296,6 +318,197 @@ EXPERIMENTS = [
         ),
         model_config="HistGradientBoosting stacker on stress-feature cached OOF probabilities + full engineered numeric and categorical meta features",
         feature_config="stress buckets + risk flags + categorical crosses + full engineered numeric features + one-hot categorical context",
+    ),
+    Experiment(
+        run_name="stress_signals_ft_stack_v1",
+        log_path=ROOT / "stress_signals_ft_stack.log",
+        run_args=[
+            "--run-name",
+            "stress_signals_ft_stack_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "ft_transformer_stack",
+            "--meta-raw-features",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we use an FT-transformer stacker on the richer stress-feature ensemble plus raw drought "
+            "signals, balanced accuracy should improve because feature-token attention can model the "
+            "remaining Medium versus High interactions more flexibly than the MLP stacker."
+        ),
+        model_config="FT-transformer stacker on stress-feature cached OOF probabilities + raw meta features",
+        feature_config="stress buckets + risk flags + categorical crosses + cached ensemble probabilities + raw drought meta features",
+    ),
+    Experiment(
+        run_name="stress_signals_ann_stack_scaled_v1",
+        log_path=ROOT / "stress_signals_ann_stack_scaled.log",
+        run_args=[
+            "--run-name",
+            "stress_signals_ann_stack_scaled_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "mlp_stack",
+            "--meta-raw-features",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we search class-specific decision scales on top of the stress-feature ANN stacker's OOF "
+            "probabilities, balanced accuracy should improve because the current champion still uses raw "
+            "argmax despite Medium being the weakest recall class."
+        ),
+        model_config="ANN stacker on stress-feature cached OOF probabilities + raw meta features + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + raw drought meta features + calibrated meta probabilities",
+    ),
+    Experiment(
+        run_name="stress_signals_ann_bag_stack_v1",
+        log_path=ROOT / "stress_signals_ann_bag_stack.log",
+        run_args=[
+            "--run-name",
+            "stress_signals_ann_bag_stack_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "mlp_bag_stack",
+            "--meta-raw-features",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we average several ANN stacker seeds before the final class-scale search, balanced "
+            "accuracy should improve because seed bagging can smooth unstable Medium-versus-High pockets "
+            "that a single ANN initialization overfits."
+        ),
+        model_config="seed-bagged ANN stacker on stress-feature cached OOF probabilities + raw meta features + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + raw drought meta features + bagged meta probabilities",
+    ),
+    Experiment(
+        run_name="stress_signals_cnn_stack_v1",
+        log_path=ROOT / "stress_signals_cnn_stack.log",
+        run_args=[
+            "--run-name",
+            "stress_signals_cnn_stack_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "cnn_stack",
+            "--meta-raw-features",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we use a CNN meta-model on the stress-feature ensemble plus raw drought signals, balanced "
+            "accuracy should improve because local convolutional filters can detect recurring probability "
+            "and stress-shape motifs that the dense ANN treats independently."
+        ),
+        model_config="CNN stacker on stress-feature cached OOF probabilities + raw meta features + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + cached ensemble probabilities + raw drought meta features",
+    ),
+    Experiment(
+        run_name="stress_signals_rnn_stack_v1",
+        log_path=ROOT / "stress_signals_rnn_stack.log",
+        run_args=[
+            "--run-name",
+            "stress_signals_rnn_stack_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "rnn_stack",
+            "--meta-raw-features",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we use a GRU-based RNN meta-model on the stress-feature ensemble plus raw drought signals, "
+            "balanced accuracy should improve because the recurrent stacker can accumulate ordered evidence "
+            "across model probabilities and drought context before making the final class decision."
+        ),
+        model_config="GRU-based RNN stacker on stress-feature cached OOF probabilities + raw meta features + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + cached ensemble probabilities + raw drought meta features",
+    ),
+    Experiment(
+        run_name="stress_signals_tabnet_stack_v1",
+        log_path=ROOT / "stress_signals_tabnet_stack.log",
+        run_args=[
+            "--run-name",
+            "stress_signals_tabnet_stack_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "tabnet_stack",
+            "--meta-raw-features",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we use a TabNet stacker on the stress-feature ensemble plus raw drought signals, balanced "
+            "accuracy should improve because sequential feature masking can focus on the strongest Medium "
+            "versus High cues instead of treating every meta-feature equally."
+        ),
+        model_config="TabNet stacker on stress-feature cached OOF probabilities + raw meta features + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + cached ensemble probabilities + raw drought meta features",
+    ),
+    Experiment(
+        run_name="stress_signals_ann_cnn_combo_v1",
+        log_path=ROOT / "stress_signals_ann_cnn_combo.log",
+        run_args=[
+            "--run-name",
+            "stress_signals_ann_cnn_combo_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "ann_cnn_combo_stack",
+            "--meta-raw-features",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we blend ANN and CNN stacker probabilities on the stress-feature ensemble, balanced "
+            "accuracy should improve because the dense model and convolutional model capture different "
+            "meta-patterns in the Medium-versus-High boundary."
+        ),
+        model_config="ANN+CNN combo stacker on stress-feature cached OOF probabilities + raw meta features + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + cached ensemble probabilities + raw drought meta features",
+    ),
+    Experiment(
+        run_name="stress_signals_neural_base_blend_v1",
+        log_path=ROOT / "stress_signals_neural_base_blend.log",
+        run_args=[
+            "--run-name",
+            "stress_signals_neural_base_blend_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "neural_base_blend_stack",
+            "--meta-raw-features",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we blend LGB, XGB, CatBoost, ANN, and CNN probabilities on the stress-feature ensemble, "
+            "balanced accuracy should improve because the neural stackers can contribute complementary "
+            "boundary corrections while CatBoost still anchors the strongest base signal."
+        ),
+        model_config="LGB+XGB+CatBoost+ANN+CNN probability blend on stress-feature cached OOF outputs + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + cached base and neural meta probabilities",
     ),
     Experiment(
         run_name="target_freq_enc_v1",
@@ -468,6 +681,31 @@ EXPERIMENTS = [
         model_config="HistGradientBoosting stacker on target-encoded cached OOF probabilities + full engineered numeric and categorical meta features",
         feature_config="stress buckets + risk flags + categorical crosses + frequency encoding + cross-fitted target encoding + full engineered numeric features + one-hot categorical context",
     ),
+    Experiment(
+        run_name="target_freq_ft_stack_v1",
+        log_path=ROOT / "target_freq_ft_stack.log",
+        run_args=[
+            "--run-name",
+            "target_freq_ft_stack_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--frequency-encoding",
+            "--target-encoding",
+            "--decision-policy",
+            "ft_transformer_stack",
+            "--meta-raw-features",
+            "--prediction-cache",
+            "cache/target_freq_enc_v1.npz",
+        ],
+        description=(
+            "If we use an FT-transformer stacker on the target-encoded ensemble plus raw drought signals, "
+            "balanced accuracy should improve because feature-token attention can combine encoded category "
+            "propensities with local agronomic interactions better than the current linear and MLP stackers."
+        ),
+        model_config="FT-transformer stacker on target-encoded cached OOF probabilities + raw meta features",
+        feature_config="stress buckets + risk flags + categorical crosses + frequency encoding + cross-fitted target encoding + raw drought meta features",
+    ),
 ]
 
 
@@ -515,8 +753,11 @@ def append_result(row: dict[str, str]) -> None:
     write_results(rows)
 
 
-def row_exists(run_name: str) -> bool:
-    return any(row["run"] == run_name for row in read_results())
+def find_row(run_name: str) -> dict[str, str] | None:
+    for row in read_results():
+        if row["run"] == run_name:
+            return row
+    return None
 
 
 def champion_score() -> float:
@@ -688,6 +929,20 @@ def handle_complete(exp: Experiment, parsed: dict[str, str | float]) -> None:
         print(f"[discard] {exp.run_name}: {score:.6f}", flush=True)
 
 
+def resume_pending_champion(exp: Experiment, parsed: dict[str, str | float]) -> None:
+    score = float(parsed["score"])
+    write_log = ROOT / f"{exp.run_name}_write.log"
+    run_command(
+        ["uv", "run", "scripts/solution.py", *exp.run_args],
+        ROOT,
+        write_log,
+    )
+    chart_update()
+    commit_hash = stage_commit_push(exp.run_name)
+    replace_pending_commit(exp.run_name, commit_hash)
+    print(f"[champion-resumed] {exp.run_name}: {score:.6f} ({commit_hash})", flush=True)
+
+
 def handle_crash(exp: Experiment, parsed: dict[str, str | float]) -> None:
     append_result(
         build_row(
@@ -707,11 +962,19 @@ def main() -> None:
 
     while time.time() < deadline:
         for exp in EXPERIMENTS:
-            if row_exists(exp.run_name):
+            row = find_row(exp.run_name)
+            if row is not None and not (
+                row["status"] == "champion" and row["commit"] == "pending"
+            ):
                 continue
 
             parsed = parse_log(exp.log_path)
             state = parsed["state"]
+            if row is not None and row["status"] == "champion" and row["commit"] == "pending":
+                if state == "complete":
+                    resume_pending_champion(exp, parsed)
+                continue
+
             if state == "complete":
                 handle_complete(exp, parsed)
             elif state == "crash":
