@@ -706,6 +706,218 @@ EXPERIMENTS = [
         model_config="FT-transformer stacker on target-encoded cached OOF probabilities + raw meta features",
         feature_config="stress buckets + risk flags + categorical crosses + frequency encoding + cross-fitted target encoding + raw drought meta features",
     ),
+    Experiment(
+        run_name="notebook_eda_ann_stack_scaled_v1",
+        log_path=ROOT / "notebook_eda_ann_stack_scaled.log",
+        run_args=[
+            "--run-name",
+            "notebook_eda_ann_stack_scaled_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--notebook-eda-features",
+            "--decision-policy",
+            "mlp_stack",
+            "--meta-raw-features",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/notebook_eda_base_v1.npz",
+        ],
+        description=(
+            "If we add the notebook-derived threshold, logit, decimal, and extra agronomy features to the "
+            "current stress-feature champion stack, balanced accuracy should improve because the meta-model "
+            "gets explicit generator-like irrigation boundaries instead of inferring them from scratch."
+        ),
+        model_config="ANN stacker on notebook-augmented stress-feature cached OOF probabilities + raw meta features + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + notebook threshold/logit/decimal/domain features + curated notebook bigram crosses",
+    ),
+    Experiment(
+        run_name="rare_group_pairte_base_v1",
+        log_path=ROOT / "rare_group_pairte_base_v1.log",
+        run_args=[
+            "--run-name",
+            "rare_group_pairte_base_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--rare-category-bucketing",
+            "--group-aggregates",
+            "--pairwise-target-encoding",
+            "--prediction-cache",
+            "cache/rare_group_pairte_base_v1.npz",
+        ],
+        description=(
+            "If we add rare-category bucketing, grouped numeric aggregates, and leakage-safe pairwise "
+            "target encoding to the stress-feature ensemble, balanced accuracy should improve because the "
+            "base learners will see stable category-pair irrigation propensities and within-group drought "
+            "deviations instead of only raw category IDs."
+        ),
+        model_config="lgb+xgb+cat refined blend with rare-category bucketing, grouped numeric aggregates, and pairwise target encoding",
+        feature_config="stress buckets + risk flags + categorical crosses + rare-bucketed categoricals + grouped numeric means/deltas/z-scores + pairwise target encoding",
+    ),
+    Experiment(
+        run_name="rare_group_pairte_ann_scaled_v1",
+        log_path=ROOT / "rare_group_pairte_ann_scaled_v1.log",
+        run_args=[
+            "--run-name",
+            "rare_group_pairte_ann_scaled_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--rare-category-bucketing",
+            "--group-aggregates",
+            "--pairwise-target-encoding",
+            "--decision-policy",
+            "mlp_stack",
+            "--meta-raw-features",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/rare_group_pairte_base_v1.npz",
+        ],
+        description=(
+            "If we stack the new rare-bucketed, group-aggregate, pairwise-target-encoded ensemble with the "
+            "ANN meta-model, balanced accuracy should improve because the stacker can combine the stronger "
+            "base probabilities with group-level drought anomalies and pairwise category propensities."
+        ),
+        model_config="ANN stacker on rare-bucketed grouped-aggregate pairwise-target-encoded cached OOF probabilities + raw meta features + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + rare-bucketed categoricals + grouped numeric means/deltas/z-scores + pairwise target encoding + calibrated meta probabilities",
+    ),
+    Experiment(
+        run_name="stress_fs_mlp_hybrid_v1",
+        log_path=ROOT / "stress_fs_mlp_hybrid_v1.log",
+        run_args=[
+            "--run-name",
+            "stress_fs_mlp_hybrid_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "mlp_stack",
+            "--meta-raw-features",
+            "--meta-full-features",
+            "--feature-selection",
+            "--feature-selection-topk",
+            "96",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we run the ANN stacker on a feature-selected hybrid meta set, balanced accuracy should improve "
+            "because the stacker can keep the strongest raw and one-hot context while dropping redundant and noisy "
+            "meta columns that previously diluted the full-feature run."
+        ),
+        model_config="ANN stacker on stress-feature cached OOF probabilities + raw/full hybrid meta features + cross-fitted feature selection + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + raw meta features + full one-hot meta context + protected stack core + selected top-k features",
+    ),
+    Experiment(
+        run_name="stress_fs_xgb_hybrid_v1",
+        log_path=ROOT / "stress_fs_xgb_hybrid_v1.log",
+        run_args=[
+            "--run-name",
+            "stress_fs_xgb_hybrid_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "xgb_stack",
+            "--meta-raw-features",
+            "--meta-full-features",
+            "--feature-selection",
+            "--feature-selection-topk",
+            "96",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we run XGBoost on the selected hybrid stacker features, balanced accuracy should improve because "
+            "tree splits can focus on the strongest meta interactions after the redundant one-hot tail is removed."
+        ),
+        model_config="XGBoost stacker on stress-feature cached OOF probabilities + raw/full hybrid meta features + cross-fitted feature selection + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + raw meta features + full one-hot meta context + protected stack core + selected top-k features",
+    ),
+    Experiment(
+        run_name="stress_fs_hgb_hybrid_v1",
+        log_path=ROOT / "stress_fs_hgb_hybrid_v1.log",
+        run_args=[
+            "--run-name",
+            "stress_fs_hgb_hybrid_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "hgb_stack",
+            "--meta-raw-features",
+            "--meta-full-features",
+            "--feature-selection",
+            "--feature-selection-topk",
+            "96",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we run HistGradientBoosting on the selected hybrid stacker features, balanced accuracy should improve "
+            "because the boosted tree can exploit the sharper reduced feature set without overfitting the full meta expansion."
+        ),
+        model_config="HistGradientBoosting stacker on stress-feature cached OOF probabilities + raw/full hybrid meta features + cross-fitted feature selection + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + raw meta features + full one-hot meta context + protected stack core + selected top-k features",
+    ),
+    Experiment(
+        run_name="stress_fs_tabnet_hybrid_v1",
+        log_path=ROOT / "stress_fs_tabnet_hybrid_v1.log",
+        run_args=[
+            "--run-name",
+            "stress_fs_tabnet_hybrid_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "tabnet_stack",
+            "--meta-raw-features",
+            "--meta-full-features",
+            "--feature-selection",
+            "--feature-selection-topk",
+            "96",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we run TabNet on the selected hybrid stacker features, balanced accuracy should improve because "
+            "sparse attentive steps should work better once the meta feature set is pruned down to the strongest signals."
+        ),
+        model_config="TabNet stacker on stress-feature cached OOF probabilities + raw/full hybrid meta features + cross-fitted feature selection + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + raw meta features + full one-hot meta context + protected stack core + selected top-k features",
+    ),
+    Experiment(
+        run_name="stress_fs_neural_blend_hybrid_v1",
+        log_path=ROOT / "stress_fs_neural_blend_hybrid_v1.log",
+        run_args=[
+            "--run-name",
+            "stress_fs_neural_blend_hybrid_v1",
+            "--categorical-crosses",
+            "--risk-flags",
+            "--stress-signals",
+            "--decision-policy",
+            "neural_base_blend_stack",
+            "--meta-raw-features",
+            "--meta-full-features",
+            "--feature-selection",
+            "--feature-selection-topk",
+            "96",
+            "--stack-class-scale-search",
+            "--prediction-cache",
+            "cache/stress_signals_crosses_v1.npz",
+        ],
+        description=(
+            "If we blend the selected-feature ANN/CNN meta models back with the tree base ensemble, balanced accuracy "
+            "should improve because the neural correction layer can stay expressive without carrying the redundant full-meta tail."
+        ),
+        model_config="ANN+CNN+tree blend on stress-feature cached OOF probabilities + raw/full hybrid meta features + cross-fitted feature selection + final class-scale calibration",
+        feature_config="stress buckets + risk flags + categorical crosses + raw meta features + full one-hot meta context + protected stack core + selected top-k features",
+    ),
 ]
 
 

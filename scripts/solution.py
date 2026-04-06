@@ -9,6 +9,7 @@ Run with:
 
 import argparse
 import os, sys
+from dataclasses import dataclass
 
 # Fix libomp path on macOS without Homebrew (uses sklearn's bundled libomp)
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +46,7 @@ LABEL_ORDER = ["Low", "Medium", "High"]  # encoded as 0, 1, 2
 MODEL_LABELS = ["LGB", "XGB", "CAT"]
 MIN_BLEND_WEIGHT = 0.05
 STACKER_N_JOBS = max(1, min(4, os.cpu_count() or 1))
+STACK_CORE_FEATURE_COUNT = len(MODEL_LABELS) * (len(LABEL_ORDER) + 3)
 torch.set_num_threads(STACKER_N_JOBS)
 
 
@@ -87,7 +89,19 @@ def parse_args():
     parser.add_argument("--frequency-encoding", action="store_true")
     parser.add_argument("--target-encoding", action="store_true")
     parser.add_argument("--target-encoding-smoothing", type=float, default=50.0)
+    parser.add_argument("--rare-category-bucketing", action="store_true")
+    parser.add_argument("--rare-category-min-count", type=int, default=12)
+    parser.add_argument("--group-aggregates", action="store_true")
+    parser.add_argument("--pairwise-target-encoding", action="store_true")
+    parser.add_argument("--pairwise-target-encoding-smoothing", type=float, default=80.0)
+    parser.add_argument("--feature-selection", action="store_true")
+    parser.add_argument("--feature-selection-topk", type=int, default=80)
+    parser.add_argument("--feature-selection-corr-threshold", type=float, default=0.995)
+    parser.add_argument("--feature-selection-max-rows", type=int, default=200000)
     parser.add_argument("--stack-class-scale-search", action="store_true")
+    parser.add_argument("--notebook-eda-features", action="store_true")
+    parser.add_argument("--notebook-original-priors", action="store_true")
+    parser.add_argument("--original-data-path", default="")
     return parser.parse_args()
 
 
@@ -118,9 +132,25 @@ print(f"Meta raw features: {ARGS.meta_raw_features}")
 print(f"Meta full features: {ARGS.meta_full_features}")
 print(f"Frequency encoding: {ARGS.frequency_encoding}")
 print(f"Target encoding: {ARGS.target_encoding}")
+print(f"Rare category bucketing: {ARGS.rare_category_bucketing}")
+print(f"Group aggregates: {ARGS.group_aggregates}")
+print(f"Pairwise target encoding: {ARGS.pairwise_target_encoding}")
+print(f"Feature selection: {ARGS.feature_selection}")
 print(f"Stack class scale search: {ARGS.stack_class_scale_search}")
+print(f"Notebook EDA features: {ARGS.notebook_eda_features}")
+print(f"Notebook original priors: {ARGS.notebook_original_priors}")
+if ARGS.original_data_path:
+    print(f"Original data path override: {ARGS.original_data_path}")
 if ARGS.target_encoding:
     print(f"Target encoding smoothing: {ARGS.target_encoding_smoothing:.1f}")
+if ARGS.rare_category_bucketing:
+    print(f"Rare category min count: {ARGS.rare_category_min_count}")
+if ARGS.pairwise_target_encoding:
+    print(f"Pairwise target encoding smoothing: {ARGS.pairwise_target_encoding_smoothing:.1f}")
+if ARGS.feature_selection:
+    print(f"Feature selection top-k: {ARGS.feature_selection_topk}")
+    print(f"Feature selection corr threshold: {ARGS.feature_selection_corr_threshold:.3f}")
+    print(f"Feature selection max rows: {ARGS.feature_selection_max_rows}")
 
 # ── 2. Encode target ──────────────────────────────────────────────────────────
 
@@ -180,6 +210,652 @@ STRESS_CAT_COLS = [
     "drought_pressure_bin",
     "peak_stage_bucket",
 ]
+NOTEBOOK_CROSS_CAT_COLS = [
+    "Crop_Growth_Stage__Crop_Type",
+    "Crop_Growth_Stage__Irrigation_Type",
+    "Irrigation_Type__Season",
+    "Mulching_Used__Irrigation_Type",
+    "Soil_Type__Crop_Type",
+    "Region__Season",
+]
+NOTEBOOK_MAGIC_COLS = [
+    "soil_lt_25",
+    "rain_lt_300",
+    "temp_gt_30",
+    "wind_gt_10",
+    "is_harvest",
+    "is_sowing",
+    "mulching_yes",
+    "magic_high_score",
+    "magic_low_score",
+    "magic_score",
+    "dist_boundary_0",
+    "dist_boundary_3",
+    "dist_boundary_min",
+    "soil_dist_25",
+    "rain_dist_300",
+    "temp_dist_30",
+    "wind_dist_10",
+]
+NOTEBOOK_DOMAIN_COLS = [
+    "total_water_input",
+    "water_balance",
+    "water_per_hectare",
+    "water_deficit",
+    "heat_stress",
+    "evapotranspiration",
+    "drying_index",
+    "temp_wind",
+    "moisture_temp_ratio",
+    "irrigation_density",
+    "rainfall_coverage",
+    "moisture_wind_ratio",
+    "moisture_rainfall_ratio",
+    "vpd_proxy",
+    "net_water_need",
+    "drought_risk",
+    "soil_health",
+    "salinity_risk",
+    "ph_deviation",
+    "moisture_retention",
+    "ec_ph_interaction",
+    "mulch_flag",
+    "mulch_moisture",
+    "mulch_et_saving",
+    "moisture_et_ratio",
+    "rain_et_balance",
+    "sunlight_temp_ratio",
+    "water_stress_index",
+]
+NOTEBOOK_BOOL_COLS = [
+    "is_rainfed",
+    "is_flowering",
+    "has_mulching",
+    "is_loamy",
+    "is_sandy",
+    "high_wind",
+    "low_rainfall",
+]
+NOTEBOOK_LOGIT_COLS = [
+    "logit_low_score",
+    "logit_medium_score",
+    "logit_high_score",
+    "logit_high_minus_low",
+    "logit_high_minus_medium",
+    "logit_low_minus_medium",
+    "logit_top_gap",
+    "logit_prob_low",
+    "logit_prob_medium",
+    "logit_prob_high",
+]
+NOTEBOOK_LOG_COLS = [f"log_{col}" for col in [
+    "Rainfall_mm",
+    "Previous_Irrigation_mm",
+    "Field_Area_hectare",
+    "Wind_Speed_kmh",
+]]
+NOTEBOOK_DECIMAL_COLS = [f"{col}_d1" for col in NUM_COLS]
+NOTEBOOK_NUM_COLS = (
+    NOTEBOOK_MAGIC_COLS
+    + NOTEBOOK_DOMAIN_COLS
+    + NOTEBOOK_BOOL_COLS
+    + NOTEBOOK_LOGIT_COLS
+    + NOTEBOOK_LOG_COLS
+    + NOTEBOOK_DECIMAL_COLS
+)
+NOTEBOOK_LOGIT_COEFS = {
+    "Low": {
+        "intercept": 16.3173,
+        "soil_lt_25": -11.0237,
+        "temp_gt_30": -5.8559,
+        "rain_lt_300": -10.8500,
+        "wind_gt_10": -5.8284,
+        "Flowering": -5.4155,
+        "Harvest": 5.5073,
+        "Sowing": 5.2299,
+        "Vegetative": -5.4617,
+        "Mulch_No": -3.0014,
+        "Mulch_Yes": 2.8613,
+    },
+    "Medium": {
+        "intercept": 4.6524,
+        "soil_lt_25": 0.3290,
+        "temp_gt_30": -0.0204,
+        "rain_lt_300": 0.1542,
+        "wind_gt_10": 0.0841,
+        "Flowering": 0.3586,
+        "Harvest": -0.1348,
+        "Sowing": -0.3547,
+        "Vegetative": 0.3334,
+        "Mulch_No": 0.1883,
+        "Mulch_Yes": 0.0142,
+    },
+    "High": {
+        "intercept": -20.9697,
+        "soil_lt_25": 10.6947,
+        "temp_gt_30": 5.8763,
+        "rain_lt_300": 10.6958,
+        "wind_gt_10": 5.7444,
+        "Flowering": 5.0569,
+        "Harvest": -5.3725,
+        "Sowing": -4.8752,
+        "Vegetative": 5.1283,
+        "Mulch_No": 2.8131,
+        "Mulch_Yes": -2.8755,
+    },
+}
+ORIGINAL_DATA_CANDIDATE_NAMES = [
+    "irrigation_prediction.csv",
+    "original_irrigation_prediction.csv",
+    "irrigation_water_requirement_prediction.csv",
+]
+MISSING_TOKEN = "__MISSING__"
+RARE_TOKEN = "__RARE__"
+GROUP_AGG_SPECS = [
+    ("Crop_Type",),
+    ("Season",),
+    ("Region",),
+    ("Crop_Growth_Stage",),
+    ("Irrigation_Type",),
+    ("Water_Source",),
+    ("Crop_Type", "Season"),
+    ("Crop_Growth_Stage", "Mulching_Used"),
+    ("Irrigation_Type", "Water_Source"),
+]
+GROUP_AGG_NUMERIC_CANDIDATES = [
+    "Soil_Moisture",
+    "Rainfall_mm",
+    "Temperature_C",
+    "Previous_Irrigation_mm",
+    "water_stress",
+    "aridity",
+    "drought_pressure",
+]
+PAIRWISE_TE_SPECS = [
+    ("Crop_Type", "Season"),
+    ("Crop_Type", "Region"),
+    ("Crop_Growth_Stage", "Mulching_Used"),
+    ("Crop_Growth_Stage", "Water_Source"),
+    ("Crop_Growth_Stage", "Irrigation_Type"),
+    ("Irrigation_Type", "Water_Source"),
+    ("Soil_Type", "Crop_Type"),
+    ("Soil_Type", "Region"),
+]
+META_OPTIONAL_COLS = [
+    "magic_score",
+    "dist_boundary_min",
+    "logit_low_score",
+    "logit_medium_score",
+    "logit_high_score",
+    "logit_top_gap",
+    "water_per_hectare",
+    "water_deficit",
+    "evapotranspiration",
+    "drying_index",
+    "vpd_proxy",
+    "water_stress_index",
+    "Crop_Type__Season__group_share",
+    "Crop_Growth_Stage__Mulching_Used__group_share",
+    "Irrigation_Type__Water_Source__group_share",
+    "Crop_Type__Season__Soil_Moisture__delta",
+    "Crop_Growth_Stage__Mulching_Used__drought_pressure__z",
+    "Irrigation_Type__Water_Source__Previous_Irrigation_mm__z",
+    "Crop_Type__Season__pairte_high",
+    "Crop_Growth_Stage__Mulching_Used__pairte_high",
+    "Irrigation_Type__Water_Source__pairte_high",
+]
+
+
+@dataclass
+class FeatureSelectionPlan:
+    fold_indices: list[np.ndarray]
+    full_indices: np.ndarray
+    total_features: int
+    protected_features: int
+
+
+def _softmax_rows(logits):
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    probs = np.exp(shifted)
+    probs /= probs.sum(axis=1, keepdims=True)
+    return probs
+
+
+def get_meta_split_indices(y_true):
+    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    return list(meta_skf.split(np.zeros(len(y_true)), y_true))
+
+
+def subsample_feature_selection_rows(X, y, sample_weights):
+    max_rows = max(1000, int(ARGS.feature_selection_max_rows))
+    if len(X) <= max_rows:
+        return X, y, sample_weights
+
+    rng = np.random.default_rng(SEED)
+    take = rng.choice(len(X), size=max_rows, replace=False)
+    take.sort()
+    return X[take], y[take], sample_weights[take]
+
+
+def compute_selector_importances(X, y, sample_weights):
+    selector_X, selector_y, selector_weights = subsample_feature_selection_rows(X, y, sample_weights)
+    selector = lgb.LGBMClassifier(
+        objective="multiclass",
+        num_class=len(LABEL_ORDER),
+        n_estimators=220,
+        learning_rate=0.05,
+        num_leaves=31,
+        max_depth=-1,
+        min_child_samples=100,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        reg_alpha=0.05,
+        reg_lambda=0.2,
+        random_state=SEED,
+        n_jobs=STACKER_N_JOBS,
+        verbose=-1,
+    )
+    selector.fit(selector_X.astype(np.float32, copy=False), selector_y, sample_weight=selector_weights)
+    importances = np.asarray(
+        selector.booster_.feature_importance(importance_type="gain"),
+        dtype=float,
+    )
+    if importances.size != X.shape[1]:
+        importances = np.resize(importances, X.shape[1])
+    if np.all(importances <= 0):
+        importances = np.asarray(selector.feature_importances_, dtype=float)
+    if np.all(importances <= 0):
+        importances = np.var(selector_X, axis=0)
+    return importances
+
+
+def compute_feature_selection_indices(X, y, sample_weights):
+    n_features = X.shape[1]
+    if not ARGS.feature_selection or n_features <= ARGS.feature_selection_topk:
+        return np.arange(n_features, dtype=int)
+
+    protected_count = min(STACK_CORE_FEATURE_COUNT, n_features)
+    target_total = max(protected_count, min(ARGS.feature_selection_topk, n_features))
+    target_candidates = target_total - protected_count
+    if target_candidates <= 0:
+        return np.arange(protected_count, dtype=int)
+
+    variances = np.var(X, axis=0)
+    candidate_indices = np.arange(protected_count, n_features, dtype=int)
+    candidate_indices = candidate_indices[variances[candidate_indices] > 1e-12]
+    if len(candidate_indices) <= target_candidates:
+        return np.arange(n_features, dtype=int) if len(candidate_indices) + protected_count == n_features else np.concatenate(
+            [np.arange(protected_count, dtype=int), candidate_indices]
+        )
+
+    importances = compute_selector_importances(X, y, sample_weights)
+    ranked_candidates = candidate_indices[np.argsort(importances[candidate_indices])[::-1]]
+
+    corr_threshold = float(ARGS.feature_selection_corr_threshold)
+    pool_limit = min(len(ranked_candidates), max(target_candidates * 4, target_candidates + 24))
+    selected_candidates = []
+
+    if corr_threshold < 0.9999 and pool_limit > 1:
+        pool = ranked_candidates[:pool_limit]
+        pool_matrix = X[:, pool].astype(np.float32, copy=False)
+        std = pool_matrix.std(axis=0)
+        standardized = (pool_matrix - pool_matrix.mean(axis=0)) / (std + 1e-6)
+        corr = np.nan_to_num(
+            np.abs(np.corrcoef(standardized, rowvar=False)),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        kept_positions = []
+        for pos, feature_idx in enumerate(pool):
+            if not kept_positions or np.all(corr[pos, kept_positions] < corr_threshold):
+                kept_positions.append(pos)
+                selected_candidates.append(feature_idx)
+            if len(selected_candidates) >= target_candidates:
+                break
+
+    if len(selected_candidates) < target_candidates:
+        selected_set = set(int(idx) for idx in selected_candidates)
+        for feature_idx in ranked_candidates:
+            if int(feature_idx) in selected_set:
+                continue
+            selected_candidates.append(int(feature_idx))
+            selected_set.add(int(feature_idx))
+            if len(selected_candidates) >= target_candidates:
+                break
+
+    keep_mask = np.zeros(n_features, dtype=bool)
+    keep_mask[:protected_count] = True
+    keep_mask[np.asarray(selected_candidates, dtype=int)] = True
+    return np.flatnonzero(keep_mask)
+
+
+def build_feature_selection_plan(train_features, y_true, sample_weights, split_indices, label):
+    if not ARGS.feature_selection:
+        return None
+
+    fold_indices = []
+    fold_counts = []
+    for tr_idx, _ in split_indices:
+        selected_idx = compute_feature_selection_indices(
+            train_features[tr_idx],
+            y_true[tr_idx],
+            sample_weights[tr_idx],
+        )
+        fold_indices.append(selected_idx)
+        fold_counts.append(len(selected_idx))
+
+    full_indices = compute_feature_selection_indices(train_features, y_true, sample_weights)
+    protected = min(STACK_CORE_FEATURE_COUNT, train_features.shape[1])
+    print(
+        f"Feature selection [{label}] — keep {len(full_indices)}/{train_features.shape[1]} "
+        f"(protected {protected}, avg fold {np.mean(fold_counts):.1f})"
+    )
+    return FeatureSelectionPlan(
+        fold_indices=fold_indices,
+        full_indices=full_indices,
+        total_features=train_features.shape[1],
+        protected_features=protected,
+    )
+
+
+def select_fold_feature_block(train_features, tr_idx, val_idx, selection_plan, fold_idx):
+    X_tr = train_features[tr_idx]
+    X_val = train_features[val_idx]
+    if selection_plan is None:
+        return X_tr, X_val
+
+    keep_indices = selection_plan.fold_indices[fold_idx]
+    return X_tr[:, keep_indices], X_val[:, keep_indices]
+
+
+def select_full_feature_block(train_features, test_features, selection_plan):
+    if selection_plan is None:
+        return train_features, test_features
+
+    keep_indices = selection_plan.full_indices
+    return train_features[:, keep_indices], test_features[:, keep_indices]
+
+
+def to_category_text(series):
+    return series.astype("string").fillna(MISSING_TOKEN).astype(str)
+
+
+def feature_name_for_spec(columns):
+    if isinstance(columns, str):
+        return columns
+    return "__".join(columns)
+
+
+def build_categorical_key(df, columns):
+    if isinstance(columns, str):
+        return to_category_text(df[columns])
+
+    key = to_category_text(df[columns[0]])
+    for col in columns[1:]:
+        key = key + "__" + to_category_text(df[col])
+    return key
+
+
+def add_notebook_logit_features(df):
+    stage_features = {
+        "Flowering": df["Crop_Growth_Stage"].eq("Flowering").astype(float),
+        "Harvest": df["Crop_Growth_Stage"].eq("Harvest").astype(float),
+        "Sowing": df["Crop_Growth_Stage"].eq("Sowing").astype(float),
+        "Vegetative": df["Crop_Growth_Stage"].eq("Vegetative").astype(float),
+    }
+    mulch_no = df["Mulching_Used"].eq("No").astype(float)
+    mulch_yes = df["Mulching_Used"].eq("Yes").astype(float)
+    logits = []
+
+    for label in LABEL_ORDER:
+        coefs = NOTEBOOK_LOGIT_COEFS[label]
+        score = np.full(len(df), coefs["intercept"], dtype=float)
+        score += coefs["soil_lt_25"] * df["soil_lt_25"].to_numpy(dtype=float)
+        score += coefs["temp_gt_30"] * df["temp_gt_30"].to_numpy(dtype=float)
+        score += coefs["rain_lt_300"] * df["rain_lt_300"].to_numpy(dtype=float)
+        score += coefs["wind_gt_10"] * df["wind_gt_10"].to_numpy(dtype=float)
+        for stage_name, stage_feature in stage_features.items():
+            score += coefs[stage_name] * stage_feature.to_numpy(dtype=float)
+        score += coefs["Mulch_No"] * mulch_no.to_numpy(dtype=float)
+        score += coefs["Mulch_Yes"] * mulch_yes.to_numpy(dtype=float)
+        df[f"logit_{label.lower()}_score"] = score
+        logits.append(score)
+
+    logit_matrix = np.column_stack(logits)
+    probs = _softmax_rows(logit_matrix)
+    sorted_logits = np.sort(logit_matrix, axis=1)
+
+    df["logit_high_minus_low"] = df["logit_high_score"] - df["logit_low_score"]
+    df["logit_high_minus_medium"] = df["logit_high_score"] - df["logit_medium_score"]
+    df["logit_low_minus_medium"] = df["logit_low_score"] - df["logit_medium_score"]
+    df["logit_top_gap"] = sorted_logits[:, -1] - sorted_logits[:, -2]
+    df["logit_prob_low"] = probs[:, 0]
+    df["logit_prob_medium"] = probs[:, 1]
+    df["logit_prob_high"] = probs[:, 2]
+    return df
+
+
+def resolve_original_data_path(path_override=""):
+    candidates = []
+    if path_override:
+        if os.path.isabs(path_override):
+            candidates.append(path_override)
+        else:
+            candidates.append(os.path.join(_project_root, path_override))
+    candidates.extend(os.path.join(DATA_DIR, name) for name in ORIGINAL_DATA_CANDIDATE_NAMES)
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return ""
+
+
+def load_original_reference_data(path_override=""):
+    resolved_path = resolve_original_data_path(path_override)
+    if not resolved_path:
+        return None, ""
+
+    original_df = pd.read_csv(resolved_path)
+    if "Irrigation_Requirement" in original_df.columns and TARGET not in original_df.columns:
+        original_df = original_df.rename(columns={"Irrigation_Requirement": TARGET})
+    if TARGET not in original_df.columns:
+        return None, resolved_path
+    return original_df, resolved_path
+
+
+def add_original_target_priors(train_df, test_df, original_df, numeric_cols, categorical_cols):
+    label_map = {label: idx for idx, label in enumerate(LABEL_ORDER)}
+    original = original_df.copy()
+    original[TARGET] = original[TARGET].map(label_map)
+    original = original.dropna(subset=[TARGET])
+    if original.empty:
+        return []
+
+    global_prior = float(original[TARGET].mean())
+    feature_names = []
+
+    for col in categorical_cols:
+        if col not in original.columns:
+            continue
+        feature_name = f"orig_prior_{col.lower()}"
+        mapping = original.groupby(original[col].astype(str))[TARGET].mean()
+        train_df[feature_name] = (
+            train_df[col].astype(str).map(mapping).fillna(global_prior).astype(np.float32)
+        )
+        test_df[feature_name] = (
+            test_df[col].astype(str).map(mapping).fillna(global_prior).astype(np.float32)
+        )
+        feature_names.append(feature_name)
+
+    for col in numeric_cols:
+        if col not in original.columns:
+            continue
+        feature_name = f"orig_prior_{col.lower()}"
+        source = original[col].dropna()
+        if source.nunique() <= 1:
+            train_df[feature_name] = np.float32(global_prior)
+            test_df[feature_name] = np.float32(global_prior)
+            feature_names.append(feature_name)
+            continue
+
+        edges = np.unique(np.histogram_bin_edges(source, bins=min(10, source.nunique())))
+        if len(edges) < 2:
+            train_df[feature_name] = np.float32(global_prior)
+            test_df[feature_name] = np.float32(global_prior)
+            feature_names.append(feature_name)
+            continue
+
+        edges = edges.astype(float)
+        edges[0] = -np.inf
+        edges[-1] = np.inf
+        bins = pd.cut(original[col], bins=edges, include_lowest=True, duplicates="drop")
+        means = original.groupby(bins, observed=False)[TARGET].mean()
+
+        train_df[feature_name] = (
+            pd.cut(train_df[col], bins=edges, include_lowest=True, duplicates="drop")
+            .map(means)
+            .fillna(global_prior)
+            .astype(np.float32)
+        )
+        test_df[feature_name] = (
+            pd.cut(test_df[col], bins=edges, include_lowest=True, duplicates="drop")
+            .map(means)
+            .fillna(global_prior)
+            .astype(np.float32)
+        )
+        feature_names.append(feature_name)
+
+    return feature_names
+
+
+def apply_rare_category_bucketing(train_df, test_df, columns, min_count):
+    bucketed_cols = []
+    for col in columns:
+        train_series = to_category_text(train_df[col])
+        test_series = to_category_text(test_df[col])
+        counts = train_series.value_counts(dropna=False)
+        keep_values = set(counts[counts >= min_count].index)
+
+        train_df[col] = np.where(train_series.isin(keep_values), train_series, RARE_TOKEN)
+        test_df[col] = np.where(test_series.isin(keep_values), test_series, RARE_TOKEN)
+
+        if len(keep_values) < len(counts):
+            bucketed_cols.append(col)
+
+    return bucketed_cols
+
+
+def add_group_aggregate_features(train_df, test_df, group_specs, numeric_candidates):
+    feature_names = []
+    numeric_cols = [col for col in numeric_candidates if col in train_df.columns]
+
+    for spec in group_specs:
+        spec_name = feature_name_for_spec(spec)
+        train_key = build_categorical_key(train_df, spec)
+        test_key = build_categorical_key(test_df, spec)
+
+        group_counts = train_key.value_counts(dropna=False)
+        count_name = f"{spec_name}__group_count"
+        share_name = f"{spec_name}__group_share"
+        train_count = train_key.map(group_counts).fillna(0.0).to_numpy(dtype=np.float32)
+        test_count = test_key.map(group_counts).fillna(0.0).to_numpy(dtype=np.float32)
+
+        train_df[count_name] = train_count
+        test_df[count_name] = test_count
+        train_df[share_name] = (train_count / max(len(train_df), 1)).astype(np.float32)
+        test_df[share_name] = (test_count / max(len(train_df), 1)).astype(np.float32)
+        feature_names.extend([count_name, share_name])
+
+        grouped = train_df.groupby(train_key, observed=False)
+        for col in numeric_cols:
+            global_mean = float(train_df[col].mean())
+            mean_map = grouped[col].mean()
+            std_map = grouped[col].std().fillna(0.0)
+
+            mean_name = f"{spec_name}__{col}__mean"
+            delta_name = f"{spec_name}__{col}__delta"
+            z_name = f"{spec_name}__{col}__z"
+
+            train_mean = train_key.map(mean_map).fillna(global_mean).to_numpy(dtype=np.float32)
+            test_mean = test_key.map(mean_map).fillna(global_mean).to_numpy(dtype=np.float32)
+            train_std = train_key.map(std_map).fillna(0.0).to_numpy(dtype=np.float32)
+            test_std = test_key.map(std_map).fillna(0.0).to_numpy(dtype=np.float32)
+
+            train_values = train_df[col].to_numpy(dtype=np.float32, copy=False)
+            test_values = test_df[col].to_numpy(dtype=np.float32, copy=False)
+            train_delta = train_values - train_mean
+            test_delta = test_values - test_mean
+            train_z = np.where(train_std > 1e-3, train_delta / (train_std + 1e-3), 0.0).astype(np.float32)
+            test_z = np.where(test_std > 1e-3, test_delta / (test_std + 1e-3), 0.0).astype(np.float32)
+
+            train_df[mean_name] = train_mean
+            test_df[mean_name] = test_mean
+            train_df[delta_name] = train_delta.astype(np.float32)
+            test_df[delta_name] = test_delta.astype(np.float32)
+            train_df[z_name] = train_z
+            test_df[z_name] = test_z
+            feature_names.extend([mean_name, delta_name, z_name])
+
+    return feature_names
+
+
+def add_pairwise_target_encoding(
+    train_df,
+    test_df,
+    y,
+    split_indices,
+    group_specs,
+    label_names,
+    smoothing,
+):
+    feature_names = []
+    priors = np.bincount(y, minlength=len(label_names)).astype(float) / len(y)
+
+    for spec in group_specs:
+        spec_name = feature_name_for_spec(spec)
+        train_series = build_categorical_key(train_df, spec)
+        test_series = build_categorical_key(test_df, spec)
+
+        for class_idx, label_name in enumerate(label_names):
+            feature_name = f"{spec_name}__pairte_{label_name.lower()}"
+            train_feature = np.full(len(train_df), priors[class_idx], dtype=np.float32)
+
+            for tr_idx, val_idx in split_indices:
+                fold_series = train_series.iloc[tr_idx]
+                fold_targets = pd.Series(
+                    (y[tr_idx] == class_idx).astype(float),
+                    index=fold_series.index,
+                )
+                fold_counts = fold_series.value_counts(dropna=False)
+                fold_positive = fold_targets.groupby(fold_series).sum()
+                mapping = (
+                    fold_positive.add(smoothing * priors[class_idx], fill_value=smoothing * priors[class_idx])
+                    / (fold_counts + smoothing)
+                )
+                train_feature[val_idx] = (
+                    train_series.iloc[val_idx].map(mapping).fillna(priors[class_idx]).to_numpy(dtype=np.float32)
+                )
+
+            full_targets = pd.Series(
+                (y == class_idx).astype(float),
+                index=train_series.index,
+            )
+            full_counts = train_series.value_counts(dropna=False)
+            full_positive = full_targets.groupby(train_series).sum()
+            full_mapping = (
+                full_positive.add(smoothing * priors[class_idx], fill_value=smoothing * priors[class_idx])
+                / (full_counts + smoothing)
+            )
+
+            train_df[feature_name] = train_feature
+            test_df[feature_name] = (
+                test_series.map(full_mapping).fillna(priors[class_idx]).astype(np.float32)
+            )
+            feature_names.append(feature_name)
+
+    return feature_names
+
 
 def add_features(df):
     df = df.copy()
@@ -271,6 +947,109 @@ def add_features(df):
             "peak_no_mulch",
             np.where(peak_stage, "peak", "other"),
         )
+    if ARGS.notebook_eda_features:
+        df["soil_lt_25"] = (df["Soil_Moisture"] < 25).astype(np.int8)
+        df["rain_lt_300"] = (df["Rainfall_mm"] < 300).astype(np.int8)
+        df["temp_gt_30"] = (df["Temperature_C"] > 30).astype(np.int8)
+        df["wind_gt_10"] = (df["Wind_Speed_kmh"] > 10).astype(np.int8)
+        df["is_harvest"] = df["Crop_Growth_Stage"].eq("Harvest").astype(np.int8)
+        df["is_sowing"] = df["Crop_Growth_Stage"].eq("Sowing").astype(np.int8)
+        df["mulching_yes"] = df["Mulching_Used"].eq("Yes").astype(np.int8)
+
+        df["magic_high_score"] = (
+            2 * df["soil_lt_25"]
+            + 2 * df["rain_lt_300"]
+            + df["temp_gt_30"]
+            + df["wind_gt_10"]
+        )
+        df["magic_low_score"] = (
+            2 * df["is_harvest"]
+            + 2 * df["is_sowing"]
+            + df["mulching_yes"]
+        )
+        df["magic_score"] = df["magic_high_score"] - df["magic_low_score"]
+        df["dist_boundary_0"] = np.abs(df["magic_score"])
+        df["dist_boundary_3"] = np.abs(df["magic_score"] - 3)
+        df["dist_boundary_min"] = np.minimum(df["dist_boundary_0"], df["dist_boundary_3"])
+        df["soil_dist_25"] = df["Soil_Moisture"] - 25
+        df["rain_dist_300"] = df["Rainfall_mm"] - 300
+        df["temp_dist_30"] = df["Temperature_C"] - 30
+        df["wind_dist_10"] = df["Wind_Speed_kmh"] - 10
+
+        df["total_water_input"] = df["Rainfall_mm"] + df["Previous_Irrigation_mm"]
+        df["water_balance"] = df["Rainfall_mm"] - df["Previous_Irrigation_mm"]
+        df["water_per_hectare"] = df["total_water_input"] / (df["Field_Area_hectare"] + 0.01)
+        df["water_deficit"] = df["Soil_Moisture"] - 0.1 * df["total_water_input"]
+        df["heat_stress"] = df["Temperature_C"] * (1 - df["Humidity"] / 100)
+        df["evapotranspiration"] = (
+            df["Temperature_C"] * df["Sunlight_Hours"] / (df["Humidity"] + 1)
+        )
+        df["drying_index"] = (
+            df["Sunlight_Hours"] * df["Wind_Speed_kmh"] / (df["Humidity"] + 1)
+        )
+        df["temp_wind"] = df["Temperature_C"] * df["Wind_Speed_kmh"]
+        df["moisture_temp_ratio"] = df["Soil_Moisture"] / (df["Temperature_C"] + 1)
+        df["irrigation_density"] = (
+            df["Previous_Irrigation_mm"] / (df["Field_Area_hectare"] + 0.01)
+        )
+        df["rainfall_coverage"] = df["Rainfall_mm"] / (df["Field_Area_hectare"] + 0.01)
+        df["moisture_wind_ratio"] = df["Soil_Moisture"] / (df["Wind_Speed_kmh"] + 1)
+        df["moisture_rainfall_ratio"] = df["Soil_Moisture"] / (df["Rainfall_mm"] + 1)
+        df["vpd_proxy"] = df["Temperature_C"] * (1 - df["Humidity"] / 100)
+        df["net_water_need"] = df["evapotranspiration"] - df["Rainfall_mm"] / 10
+        df["drought_risk"] = df["drying_index"] * (100 - df["Soil_Moisture"]) / 100
+        df["soil_health"] = (
+            df["Organic_Carbon"] * df["Soil_Moisture"] / (df["Electrical_Conductivity"] + 0.1)
+        )
+        df["salinity_risk"] = (
+            df["Electrical_Conductivity"] * df["Temperature_C"] / (df["Rainfall_mm"] + 1)
+        )
+        df["ph_deviation"] = np.abs(df["Soil_pH"] - 6.5)
+        df["moisture_retention"] = df["Soil_Moisture"] * df["Organic_Carbon"]
+        df["ec_ph_interaction"] = df["Electrical_Conductivity"] * df["Soil_pH"]
+        df["mulch_flag"] = df["Mulching_Used"].map({"Yes": 1.0, "No": 0.0}).fillna(0.0)
+        df["mulch_moisture"] = df["Soil_Moisture"] * (1 + 0.5 * df["mulch_flag"])
+        df["mulch_et_saving"] = df["evapotranspiration"] * (1 - 0.3 * df["mulch_flag"])
+        df["moisture_et_ratio"] = df["Soil_Moisture"] / (df["evapotranspiration"] + 0.1)
+        df["rain_et_balance"] = df["Rainfall_mm"] - 2 * df["evapotranspiration"]
+        df["sunlight_temp_ratio"] = df["Sunlight_Hours"] / (df["Temperature_C"] + 1)
+        df["water_stress_index"] = (
+            df["evapotranspiration"] - df["total_water_input"] / 10
+        ) / (df["Soil_Moisture"] + 1)
+
+        df["is_rainfed"] = df["Irrigation_Type"].eq("Rainfed").astype(np.int8)
+        df["is_flowering"] = df["Crop_Growth_Stage"].eq("Flowering").astype(np.int8)
+        df["has_mulching"] = df["Mulching_Used"].eq("Yes").astype(np.int8)
+        df["is_loamy"] = df["Soil_Type"].eq("Loamy").astype(np.int8)
+        df["is_sandy"] = df["Soil_Type"].eq("Sandy").astype(np.int8)
+        df["high_wind"] = (df["Wind_Speed_kmh"] > 15).astype(np.int8)
+        df["low_rainfall"] = (df["Rainfall_mm"] < 500).astype(np.int8)
+
+        for col in NUM_COLS:
+            values = df[col].to_numpy(dtype=float, copy=False)
+            frac = values - np.floor(values)
+            df[f"{col}_d1"] = np.clip(np.floor(frac * 10 + 1e-9), 0, 9).astype(np.int8)
+
+        for col in ["Rainfall_mm", "Previous_Irrigation_mm", "Field_Area_hectare", "Wind_Speed_kmh"]:
+            df[f"log_{col}"] = np.log1p(df[col])
+
+        df = add_notebook_logit_features(df)
+        df["Crop_Growth_Stage__Crop_Type"] = (
+            df["Crop_Growth_Stage"].astype(str) + "__" + df["Crop_Type"].astype(str)
+        )
+        df["Crop_Growth_Stage__Irrigation_Type"] = (
+            df["Crop_Growth_Stage"].astype(str) + "__" + df["Irrigation_Type"].astype(str)
+        )
+        df["Irrigation_Type__Season"] = (
+            df["Irrigation_Type"].astype(str) + "__" + df["Season"].astype(str)
+        )
+        df["Mulching_Used__Irrigation_Type"] = (
+            df["Mulching_Used"].astype(str) + "__" + df["Irrigation_Type"].astype(str)
+        )
+        df["Soil_Type__Crop_Type"] = (
+            df["Soil_Type"].astype(str) + "__" + df["Crop_Type"].astype(str)
+        )
+        df["Region__Season"] = df["Region"].astype(str) + "__" + df["Season"].astype(str)
     if ARGS.categorical_crosses:
         df["Crop_Type__Season"] = df["Crop_Type"].astype(str) + "__" + df["Season"].astype(str)
         df["Irrigation_Type__Water_Source"] = (
@@ -620,27 +1399,29 @@ def build_meta_raw_features(df):
         + (df["Rainfall_mm"] <= 1000).astype(np.int8)
         + (peak_stage & no_mulch).astype(np.int8)
     )
-    meta_frame = pd.DataFrame(
-        {
-            "Soil_Moisture": df["Soil_Moisture"],
-            "Temperature_C": df["Temperature_C"],
-            "Wind_Speed_kmh": df["Wind_Speed_kmh"],
-            "Rainfall_mm": df["Rainfall_mm"],
-            "Previous_Irrigation_mm": df["Previous_Irrigation_mm"],
-            "Field_Area_hectare": df["Field_Area_hectare"],
-            "water_stress": df["water_stress"],
-            "effective_rain": df["effective_rain"],
-            "aridity": df["aridity"],
-            "moisture_deficit": moisture_deficit,
-            "drought_pressure": drought_pressure,
-            "stress_count": stress_count,
-            "is_peak_stage": peak_stage,
-            "is_no_mulch": no_mulch,
-            "is_river_source": river_source,
-            "is_canal_irrigation": canal_irrigation,
-            "is_peak_no_mulch": (peak_stage & no_mulch).astype(np.int8),
-        }
-    )
+    meta_dict = {
+        "Soil_Moisture": df["Soil_Moisture"],
+        "Temperature_C": df["Temperature_C"],
+        "Wind_Speed_kmh": df["Wind_Speed_kmh"],
+        "Rainfall_mm": df["Rainfall_mm"],
+        "Previous_Irrigation_mm": df["Previous_Irrigation_mm"],
+        "Field_Area_hectare": df["Field_Area_hectare"],
+        "water_stress": df["water_stress"],
+        "effective_rain": df["effective_rain"],
+        "aridity": df["aridity"],
+        "moisture_deficit": moisture_deficit,
+        "drought_pressure": drought_pressure,
+        "stress_count": stress_count,
+        "is_peak_stage": peak_stage,
+        "is_no_mulch": no_mulch,
+        "is_river_source": river_source,
+        "is_canal_irrigation": canal_irrigation,
+        "is_peak_no_mulch": (peak_stage & no_mulch).astype(np.int8),
+    }
+    for col in META_OPTIONAL_COLS:
+        if col in df.columns:
+            meta_dict[col] = df[col]
+    meta_frame = pd.DataFrame(meta_dict)
     return meta_frame.values.astype(float)
 
 
@@ -664,9 +1445,11 @@ def add_frequency_encoding(train_df, test_df, columns):
     feature_names = []
     for col in columns:
         feature_name = f"{col}__freq"
-        frequencies = train_df[col].value_counts(normalize=True, dropna=False)
-        train_df[feature_name] = train_df[col].map(frequencies).fillna(0.0).astype(float)
-        test_df[feature_name] = test_df[col].map(frequencies).fillna(0.0).astype(float)
+        train_series = to_category_text(train_df[col])
+        test_series = to_category_text(test_df[col])
+        frequencies = train_series.value_counts(normalize=True, dropna=False)
+        train_df[feature_name] = train_series.map(frequencies).fillna(0.0).astype(float)
+        test_df[feature_name] = test_series.map(frequencies).fillna(0.0).astype(float)
         feature_names.append(feature_name)
     return feature_names
 
@@ -684,8 +1467,8 @@ def add_target_encoding(
     priors = np.bincount(y, minlength=len(label_names)).astype(float) / len(y)
 
     for col in columns:
-        train_series = train_df[col].astype(str)
-        test_series = test_df[col].astype(str)
+        train_series = to_category_text(train_df[col])
+        test_series = to_category_text(test_df[col])
 
         for class_idx, label_name in enumerate(label_names):
             feature_name = f"{col}__te_{label_name.lower()}"
@@ -734,7 +1517,14 @@ def run_logreg_stack(
     sample_weights,
     apply_class_scale_search=False,
 ):
-    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        "logreg",
+    )
     candidate_cs = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
     candidate_weights = [None, "balanced"]
 
@@ -746,10 +1536,17 @@ def run_logreg_stack(
     for class_weight in candidate_weights:
         for c_value in candidate_cs:
             oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
-            for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+            for fold_idx, (tr_idx, val_idx) in enumerate(split_indices):
+                fold_train, fold_val = select_fold_feature_block(
+                    train_features,
+                    tr_idx,
+                    val_idx,
+                    selection_plan,
+                    fold_idx,
+                )
                 scaler = StandardScaler()
-                X_tr = scaler.fit_transform(train_features[tr_idx])
-                X_val = scaler.transform(train_features[val_idx])
+                X_tr = scaler.fit_transform(fold_train)
+                X_val = scaler.transform(fold_val)
                 model = LogisticRegression(
                     C=c_value,
                     class_weight=class_weight,
@@ -790,8 +1587,13 @@ def run_logreg_stack(
         solver="lbfgs",
     )
     scaler = StandardScaler()
-    train_scaled = scaler.fit_transform(train_features)
-    test_scaled = scaler.transform(test_features)
+    selected_train, selected_test = select_full_feature_block(
+        train_features,
+        test_features,
+        selection_plan,
+    )
+    train_scaled = scaler.fit_transform(selected_train)
+    test_scaled = scaler.transform(selected_test)
     full_model.fit(train_scaled, y_true, sample_weight=sample_weights)
     test_proba = full_model.predict_proba(test_scaled)
     final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
@@ -806,7 +1608,14 @@ def run_mlp_stack(
     sample_weights,
     apply_class_scale_search=False,
 ):
-    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        "mlp",
+    )
     candidate_configs = [
         {"hidden_layer_sizes": (64, 32), "alpha": 1e-4, "learning_rate_init": 1e-3},
         {"hidden_layer_sizes": (128, 64), "alpha": 5e-4, "learning_rate_init": 1e-3},
@@ -834,10 +1643,17 @@ def run_mlp_stack(
 
     for config in candidate_configs:
         oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
-        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+        for fold_idx, (tr_idx, val_idx) in enumerate(split_indices):
+            fold_train, fold_val = select_fold_feature_block(
+                train_features,
+                tr_idx,
+                val_idx,
+                selection_plan,
+                fold_idx,
+            )
             scaler = StandardScaler()
-            X_tr = scaler.fit_transform(train_features[tr_idx])
-            X_val = scaler.transform(train_features[val_idx])
+            X_tr = scaler.fit_transform(fold_train)
+            X_val = scaler.transform(fold_val)
             model = MLPClassifier(
                 hidden_layer_sizes=config["hidden_layer_sizes"],
                 alpha=config["alpha"],
@@ -871,8 +1687,13 @@ def run_mlp_stack(
     print_class_scale_summary("Best mlp stack class scales", best_class_scales)
 
     scaler = StandardScaler()
-    train_scaled = scaler.fit_transform(train_features)
-    test_scaled = scaler.transform(test_features)
+    selected_train, selected_test = select_full_feature_block(
+        train_features,
+        test_features,
+        selection_plan,
+    )
+    train_scaled = scaler.fit_transform(selected_train)
+    test_scaled = scaler.transform(selected_test)
     full_model = MLPClassifier(
         hidden_layer_sizes=best_config["hidden_layer_sizes"],
         alpha=best_config["alpha"],
@@ -897,7 +1718,14 @@ def run_mlp_bag_stack(
     sample_weights,
     apply_class_scale_search=False,
 ):
-    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        "mlp-bag",
+    )
     candidate_configs = [
         {"hidden_layer_sizes": (64, 32), "alpha": 1e-4, "learning_rate_init": 1e-3},
         {"hidden_layer_sizes": (128, 64), "alpha": 5e-4, "learning_rate_init": 1e-3},
@@ -926,10 +1754,17 @@ def run_mlp_bag_stack(
 
     for config in candidate_configs:
         oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
-        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+        for fold_idx, (tr_idx, val_idx) in enumerate(split_indices):
+            fold_train, fold_val = select_fold_feature_block(
+                train_features,
+                tr_idx,
+                val_idx,
+                selection_plan,
+                fold_idx,
+            )
             scaler = StandardScaler()
-            X_tr = scaler.fit_transform(train_features[tr_idx])
-            X_val = scaler.transform(train_features[val_idx])
+            X_tr = scaler.fit_transform(fold_train)
+            X_val = scaler.transform(fold_val)
             fold_proba = np.zeros((len(val_idx), len(LABEL_ORDER)), dtype=np.float32)
 
             for random_seed in bag_seeds:
@@ -969,9 +1804,14 @@ def run_mlp_bag_stack(
     print_class_scale_summary("Best mlp bag stack class scales", best_class_scales)
 
     scaler = StandardScaler()
-    train_scaled = scaler.fit_transform(train_features)
-    test_scaled = scaler.transform(test_features)
-    test_proba = np.zeros((len(test_features), len(LABEL_ORDER)), dtype=np.float32)
+    selected_train, selected_test = select_full_feature_block(
+        train_features,
+        test_features,
+        selection_plan,
+    )
+    train_scaled = scaler.fit_transform(selected_train)
+    test_scaled = scaler.transform(selected_test)
+    test_proba = np.zeros((len(selected_test), len(LABEL_ORDER)), dtype=np.float32)
 
     for random_seed in bag_seeds:
         full_model = MLPClassifier(
@@ -998,14 +1838,22 @@ def collect_mlp_oof_probabilities(
     config,
     *,
     random_seeds,
+    selection_plan=None,
 ):
-    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    split_indices = get_meta_split_indices(y_true)
     oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
 
-    for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+    for fold_idx, (tr_idx, val_idx) in enumerate(split_indices):
+        fold_train, fold_val = select_fold_feature_block(
+            train_features,
+            tr_idx,
+            val_idx,
+            selection_plan,
+            fold_idx,
+        )
         scaler = StandardScaler()
-        X_tr = scaler.fit_transform(train_features[tr_idx])
-        X_val = scaler.transform(train_features[val_idx])
+        X_tr = scaler.fit_transform(fold_train)
+        X_val = scaler.transform(fold_val)
         fold_proba = np.zeros((len(val_idx), len(LABEL_ORDER)), dtype=np.float32)
 
         for random_seed in random_seeds:
@@ -1035,7 +1883,13 @@ def train_mlp_test_probabilities(
     config,
     *,
     random_seeds,
+    selection_plan=None,
 ):
+    train_features, test_features = select_full_feature_block(
+        train_features,
+        test_features,
+        selection_plan,
+    )
     scaler = StandardScaler()
     train_scaled = scaler.fit_transform(train_features)
     test_scaled = scaler.transform(test_features)
@@ -1195,15 +2049,23 @@ def collect_torch_oof_probabilities(
     sample_weights,
     config,
     model_builder,
+    selection_plan=None,
 ):
-    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    split_indices = get_meta_split_indices(y_true)
     oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
     fold_epochs = []
 
-    for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+    for fold_idx, (tr_idx, val_idx) in enumerate(split_indices):
+        fold_train, fold_val = select_fold_feature_block(
+            train_features,
+            tr_idx,
+            val_idx,
+            selection_plan,
+            fold_idx,
+        )
         scaler = StandardScaler()
-        X_tr = scaler.fit_transform(train_features[tr_idx]).astype(np.float32)
-        X_val = scaler.transform(train_features[val_idx]).astype(np.float32)
+        X_tr = scaler.fit_transform(fold_train).astype(np.float32)
+        X_val = scaler.transform(fold_val).astype(np.float32)
 
         model, _, best_epoch = fit_torch_model(
             model_builder(X_tr.shape[1], config),
@@ -1228,7 +2090,13 @@ def train_torch_test_probabilities(
     config,
     model_builder,
     fold_epochs,
+    selection_plan=None,
 ):
+    train_features, test_features = select_full_feature_block(
+        train_features,
+        test_features,
+        selection_plan,
+    )
     scaler = StandardScaler()
     train_scaled = scaler.fit_transform(train_features).astype(np.float32)
     test_scaled = scaler.transform(test_features).astype(np.float32)
@@ -1256,6 +2124,14 @@ def run_torch_stack(
     label,
     apply_class_scale_search=False,
 ):
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        label,
+    )
     best_score = -1.0
     best_pred = None
     best_config = None
@@ -1269,6 +2145,7 @@ def run_torch_stack(
             sample_weights,
             config,
             model_builder,
+            selection_plan=selection_plan,
         )
 
         score, oof_pred, class_scales = evaluate_probability_policy(
@@ -1294,6 +2171,7 @@ def run_torch_stack(
         best_config,
         model_builder,
         best_epochs,
+        selection_plan=selection_plan,
     )
     final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
 
@@ -1573,15 +2451,22 @@ def build_tabnet_classifier(input_dim, config, seed):
     )
 
 
-def collect_tabnet_oof_probabilities(train_features, y_true, sample_weights, config):
-    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+def collect_tabnet_oof_probabilities(train_features, y_true, sample_weights, config, selection_plan=None):
+    split_indices = get_meta_split_indices(y_true)
     oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
     fold_epochs = []
 
-    for fold_idx, (tr_idx, val_idx) in enumerate(meta_skf.split(train_features, y_true)):
+    for fold_idx, (tr_idx, val_idx) in enumerate(split_indices):
+        fold_train, fold_val = select_fold_feature_block(
+            train_features,
+            tr_idx,
+            val_idx,
+            selection_plan,
+            fold_idx,
+        )
         scaler = StandardScaler()
-        X_tr = scaler.fit_transform(train_features[tr_idx]).astype(np.float32)
-        X_val = scaler.transform(train_features[val_idx]).astype(np.float32)
+        X_tr = scaler.fit_transform(fold_train).astype(np.float32)
+        X_val = scaler.transform(fold_val).astype(np.float32)
         model = build_tabnet_classifier(X_tr.shape[1], config, SEED + fold_idx)
         model.fit(
             X_tr,
@@ -1611,7 +2496,13 @@ def train_tabnet_test_probabilities(
     sample_weights,
     config,
     fold_epochs,
+    selection_plan=None,
 ):
+    train_features, test_features = select_full_feature_block(
+        train_features,
+        test_features,
+        selection_plan,
+    )
     scaler = StandardScaler()
     train_scaled = scaler.fit_transform(train_features).astype(np.float32)
     test_scaled = scaler.transform(test_features).astype(np.float32)
@@ -1638,6 +2529,14 @@ def run_tabnet_stack(
     sample_weights,
     apply_class_scale_search=False,
 ):
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        "tabnet",
+    )
     candidate_configs = [
         {
             "n_d": 16,
@@ -1677,6 +2576,7 @@ def run_tabnet_stack(
             y_true,
             sample_weights,
             config,
+            selection_plan=selection_plan,
         )
         score, oof_pred, class_scales = evaluate_probability_policy(
             oof_proba,
@@ -1707,6 +2607,7 @@ def run_tabnet_stack(
         sample_weights,
         best_config,
         best_epochs,
+        selection_plan=selection_plan,
     )
     final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
     return best_score, best_pred, final_test_pred
@@ -1756,6 +2657,14 @@ def run_ann_cnn_combo_stack(
     sample_weights,
     apply_class_scale_search=False,
 ):
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        "ann-cnn",
+    )
     mlp_candidates = [
         {"hidden_layer_sizes": (128, 64), "alpha": 5e-4, "learning_rate_init": 1e-3},
         {"hidden_layer_sizes": (192, 96, 32), "alpha": 5e-4, "learning_rate_init": 5e-4},
@@ -1794,6 +2703,7 @@ def run_ann_cnn_combo_stack(
                     sample_weights,
                     config,
                     random_seeds=[SEED],
+                    selection_plan=selection_plan,
                 ),
             }
         )
@@ -1811,6 +2721,7 @@ def run_ann_cnn_combo_stack(
                 kernel_size=cfg["kernel_size"],
                 dropout=cfg["dropout"],
             ),
+            selection_plan=selection_plan,
         )
         cnn_bank.append({"config": config, "oof": oof_proba, "fold_epochs": fold_epochs})
 
@@ -1862,6 +2773,7 @@ def run_ann_cnn_combo_stack(
         sample_weights,
         best_ann["config"],
         random_seeds=[SEED],
+        selection_plan=selection_plan,
     )
     cnn_test = train_torch_test_probabilities(
         train_features,
@@ -1876,6 +2788,7 @@ def run_ann_cnn_combo_stack(
             dropout=cfg["dropout"],
         ),
         best_cnn["fold_epochs"],
+        selection_plan=selection_plan,
     )
     test_proba = best_weight * ann_test + (1.0 - best_weight) * cnn_test
     final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
@@ -1950,6 +2863,14 @@ def run_neural_base_blend_stack(
     base_weights,
     apply_class_scale_search=False,
 ):
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        "neural-base",
+    )
     ann_config = {
         "hidden_layer_sizes": (128, 64),
         "alpha": 5e-4,
@@ -1984,6 +2905,7 @@ def run_neural_base_blend_stack(
         sample_weights,
         ann_config,
         random_seeds=[SEED],
+        selection_plan=selection_plan,
     )
 
     best_score = -1.0
@@ -2004,6 +2926,7 @@ def run_neural_base_blend_stack(
                 kernel_size=cfg["kernel_size"],
                 dropout=cfg["dropout"],
             ),
+            selection_plan=selection_plan,
         )
         score, combo, pred, class_scales = search_base_neural_combo(
             prob_matrices_oof,
@@ -2047,6 +2970,7 @@ def run_neural_base_blend_stack(
         sample_weights,
         ann_config,
         random_seeds=[SEED],
+        selection_plan=selection_plan,
     )
     cnn_test = train_torch_test_probabilities(
         train_features,
@@ -2061,6 +2985,7 @@ def run_neural_base_blend_stack(
             dropout=cfg["dropout"],
         ),
         best_cnn["fold_epochs"],
+        selection_plan=selection_plan,
     )
     test_blend = blend_probabilities(
         list(prob_matrices_test) + [ann_test, cnn_test],
@@ -2077,7 +3002,14 @@ def run_xgb_stack(
     sample_weights,
     apply_class_scale_search=False,
 ):
-    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        "xgb",
+    )
     candidate_configs = [
         {
             "max_depth": 4,
@@ -2104,7 +3036,14 @@ def run_xgb_stack(
 
     for config in candidate_configs:
         oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
-        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+        for fold_idx, (tr_idx, val_idx) in enumerate(split_indices):
+            fold_train, fold_val = select_fold_feature_block(
+                train_features,
+                tr_idx,
+                val_idx,
+                selection_plan,
+                fold_idx,
+            )
             model = xgb.XGBClassifier(
                 objective="multi:softprob",
                 num_class=3,
@@ -2124,13 +3063,13 @@ def run_xgb_stack(
                 early_stopping_rounds=50,
             )
             model.fit(
-                train_features[tr_idx],
+                fold_train,
                 y_true[tr_idx],
                 sample_weight=sample_weights[tr_idx],
-                eval_set=[(train_features[val_idx], y_true[val_idx])],
+                eval_set=[(fold_val, y_true[val_idx])],
                 verbose=False,
             )
-            oof_proba[val_idx] = model.predict_proba(train_features[val_idx])
+            oof_proba[val_idx] = model.predict_proba(fold_val)
 
         score, oof_pred, class_scales = evaluate_probability_policy(
             oof_proba,
@@ -2169,8 +3108,13 @@ def run_xgb_stack(
         n_jobs=STACKER_N_JOBS,
         verbosity=0,
     )
-    full_model.fit(train_features, y_true, sample_weight=sample_weights)
-    test_proba = full_model.predict_proba(test_features)
+    selected_train, selected_test = select_full_feature_block(
+        train_features,
+        test_features,
+        selection_plan,
+    )
+    full_model.fit(selected_train, y_true, sample_weight=sample_weights)
+    test_proba = full_model.predict_proba(selected_test)
     final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
 
     return best_score, best_pred, final_test_pred
@@ -2183,7 +3127,14 @@ def run_hgb_stack(
     sample_weights,
     apply_class_scale_search=False,
 ):
-    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        "hgb",
+    )
     candidate_configs = [
         {
             "learning_rate": 0.05,
@@ -2208,7 +3159,14 @@ def run_hgb_stack(
 
     for config in candidate_configs:
         oof_proba = np.zeros((len(y_true), len(LABEL_ORDER)), dtype=np.float32)
-        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+        for fold_idx, (tr_idx, val_idx) in enumerate(split_indices):
+            fold_train, fold_val = select_fold_feature_block(
+                train_features,
+                tr_idx,
+                val_idx,
+                selection_plan,
+                fold_idx,
+            )
             model = HistGradientBoostingClassifier(
                 learning_rate=config["learning_rate"],
                 max_depth=config["max_depth"],
@@ -2220,11 +3178,11 @@ def run_hgb_stack(
                 random_state=SEED,
             )
             model.fit(
-                train_features[tr_idx],
+                fold_train,
                 y_true[tr_idx],
                 sample_weight=sample_weights[tr_idx],
             )
-            oof_proba[val_idx] = model.predict_proba(train_features[val_idx])
+            oof_proba[val_idx] = model.predict_proba(fold_val)
 
         score, oof_pred, class_scales = evaluate_probability_policy(
             oof_proba,
@@ -2256,15 +3214,27 @@ def run_hgb_stack(
         early_stopping=True,
         random_state=SEED,
     )
-    full_model.fit(train_features, y_true, sample_weight=sample_weights)
-    test_proba = full_model.predict_proba(test_features)
+    selected_train, selected_test = select_full_feature_block(
+        train_features,
+        test_features,
+        selection_plan,
+    )
+    full_model.fit(selected_train, y_true, sample_weight=sample_weights)
+    test_proba = full_model.predict_proba(selected_test)
     final_test_pred = predict_with_class_scales(test_proba, best_class_scales)
 
     return best_score, best_pred, final_test_pred
 
 
 def run_ordinal_xgb_stack(train_features, y_true, test_features, sample_weights):
-    meta_skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    split_indices = get_meta_split_indices(y_true)
+    selection_plan = build_feature_selection_plan(
+        train_features,
+        y_true,
+        sample_weights,
+        split_indices,
+        "ordinal-xgb",
+    )
     candidate_configs = [
         {
             "max_depth": 4,
@@ -2291,7 +3261,14 @@ def run_ordinal_xgb_stack(train_features, y_true, test_features, sample_weights)
 
     for config in candidate_configs:
         oof_score = np.zeros(len(y_true), dtype=float)
-        for tr_idx, val_idx in meta_skf.split(train_features, y_true):
+        for fold_idx, (tr_idx, val_idx) in enumerate(split_indices):
+            fold_train, fold_val = select_fold_feature_block(
+                train_features,
+                tr_idx,
+                val_idx,
+                selection_plan,
+                fold_idx,
+            )
             model = xgb.XGBRegressor(
                 objective="reg:squarederror",
                 n_estimators=1200,
@@ -2309,13 +3286,13 @@ def run_ordinal_xgb_stack(train_features, y_true, test_features, sample_weights)
                 early_stopping_rounds=50,
             )
             model.fit(
-                train_features[tr_idx],
+                fold_train,
                 y_true[tr_idx],
                 sample_weight=sample_weights[tr_idx],
-                eval_set=[(train_features[val_idx], y_true[val_idx])],
+                eval_set=[(fold_val, y_true[val_idx])],
                 verbose=False,
             )
-            oof_score[val_idx] = model.predict(train_features[val_idx])
+            oof_score[val_idx] = model.predict(fold_val)
 
         score, thresholds, pred = search_ordinal_thresholds(oof_score, y_true)
         if score > best_score:
@@ -2352,8 +3329,13 @@ def run_ordinal_xgb_stack(train_features, y_true, test_features, sample_weights)
         n_jobs=STACKER_N_JOBS,
         verbosity=0,
     )
-    full_model.fit(train_features, y_true, sample_weight=sample_weights)
-    test_scores = full_model.predict(test_features)
+    selected_train, selected_test = select_full_feature_block(
+        train_features,
+        test_features,
+        selection_plan,
+    )
+    full_model.fit(selected_train, y_true, sample_weight=sample_weights)
+    test_scores = full_model.predict(selected_test)
     final_test_pred = predict_with_ordinal_thresholds(test_scores, best_thresholds)
 
     return best_score, best_pred, final_test_pred
@@ -2361,16 +3343,54 @@ def run_ordinal_xgb_stack(train_features, y_true, test_features, sample_weights)
 train = add_features(train)
 test  = add_features(test)
 
+NOTEBOOK_PRIOR_COLS = []
+if ARGS.notebook_original_priors:
+    original_df, original_path = load_original_reference_data(ARGS.original_data_path)
+    if original_df is None:
+        print("Notebook original priors: skipped (reference CSV not found or invalid)")
+    else:
+        NOTEBOOK_PRIOR_COLS = add_original_target_priors(
+            train,
+            test,
+            original_df,
+            NUM_COLS,
+            BASE_CAT_COLS,
+        )
+        print(f"Notebook original priors loaded ← {original_path}")
+        print(f"Notebook original prior feature count: {len(NOTEBOOK_PRIOR_COLS)}")
+
 CAT_COLS = (
     BASE_CAT_COLS
     + (CROSS_CAT_COLS if ARGS.categorical_crosses else [])
     + (STRESS_CAT_COLS if ARGS.stress_signals else [])
+    + (NOTEBOOK_CROSS_CAT_COLS if ARGS.notebook_eda_features else [])
 )
 y = train["label"].values
 skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 split_indices = list(skf.split(train, y))
 
+RARE_BUCKETED_COLS = []
+if ARGS.rare_category_bucketing:
+    RARE_BUCKETED_COLS = apply_rare_category_bucketing(
+        train,
+        test,
+        CAT_COLS,
+        ARGS.rare_category_min_count,
+    )
+    print(f"Rare-bucketed categorical columns: {len(RARE_BUCKETED_COLS)}")
+
 ENCODING_NUM_COLS = []
+GROUP_AGG_COLS = []
+PAIRWISE_TE_COLS = []
+if ARGS.group_aggregates:
+    GROUP_AGG_COLS.extend(
+        add_group_aggregate_features(
+            train,
+            test,
+            GROUP_AGG_SPECS,
+            GROUP_AGG_NUMERIC_CANDIDATES,
+        )
+    )
 if ARGS.frequency_encoding:
     ENCODING_NUM_COLS.extend(add_frequency_encoding(train, test, CAT_COLS))
 if ARGS.target_encoding:
@@ -2385,15 +3405,35 @@ if ARGS.target_encoding:
             ARGS.target_encoding_smoothing,
         )
     )
+if ARGS.pairwise_target_encoding:
+    PAIRWISE_TE_COLS.extend(
+        add_pairwise_target_encoding(
+            train,
+            test,
+            y,
+            split_indices,
+            PAIRWISE_TE_SPECS,
+            LABEL_ORDER,
+            ARGS.pairwise_target_encoding_smoothing,
+        )
+    )
+if GROUP_AGG_COLS:
+    print(f"Generated group aggregate feature count: {len(GROUP_AGG_COLS)}")
 if ENCODING_NUM_COLS:
     print(f"Generated encoding feature count: {len(ENCODING_NUM_COLS)}")
+if PAIRWISE_TE_COLS:
+    print(f"Generated pairwise target encoding feature count: {len(PAIRWISE_TE_COLS)}")
 
 MODEL_NUM_COLS = (
     NUM_COLS
     + ENG_COLS
     + (RISK_FLAG_COLS if ARGS.risk_flags else [])
     + (STRESS_NUM_COLS if ARGS.stress_signals else [])
+    + (NOTEBOOK_NUM_COLS if ARGS.notebook_eda_features else [])
+    + NOTEBOOK_PRIOR_COLS
+    + GROUP_AGG_COLS
     + ENCODING_NUM_COLS
+    + PAIRWISE_TE_COLS
 )
 FEAT_COLS = MODEL_NUM_COLS + CAT_COLS  # used by CatBoost
 
@@ -2429,6 +3469,7 @@ if ARGS.meta_full_features and ARGS.decision_policy in {
         BASE_CAT_COLS
         + (CROSS_CAT_COLS if ARGS.categorical_crosses else [])
         + (STRESS_CAT_COLS if ARGS.stress_signals else [])
+        + (NOTEBOOK_CROSS_CAT_COLS if ARGS.notebook_eda_features else [])
     )
     meta_train_full, meta_test_full = build_meta_full_features(
         train,

@@ -25,9 +25,27 @@ while [[ ! -f "$STRESS_CACHE" ]]; do
   sleep 60
 done
 
-while pgrep -f 'scripts/solution.py --run-name stress_signals_(ft_stack_v1|ann_stack_scaled_v1|cnn_stack_v1|rnn_stack_v1|ann_bag_stack_v1)' >/dev/null; do
-  sleep 60
-done
+run_experiment stress_signals_cnn_stack_v1 stress_signals_cnn_stack.log \
+  --run-name stress_signals_cnn_stack_v1 \
+  --categorical-crosses \
+  --risk-flags \
+  --stress-signals \
+  --decision-policy cnn_stack \
+  --meta-raw-features \
+  --stack-class-scale-search \
+  --prediction-cache "$STRESS_CACHE" \
+  --skip-predictions
+
+run_experiment stress_signals_rnn_stack_v1 stress_signals_rnn_stack.log \
+  --run-name stress_signals_rnn_stack_v1 \
+  --categorical-crosses \
+  --risk-flags \
+  --stress-signals \
+  --decision-policy rnn_stack \
+  --meta-raw-features \
+  --stack-class-scale-search \
+  --prediction-cache "$STRESS_CACHE" \
+  --skip-predictions
 
 run_experiment stress_signals_tabnet_stack_v1 stress_signals_tabnet_stack.log \
   --run-name stress_signals_tabnet_stack_v1 \
