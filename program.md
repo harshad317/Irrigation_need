@@ -4,20 +4,25 @@
 
 1. Read following files:
    - `README.md`
-   - `solution.py`
+   - `scripts/solution.py`
+   - `scripts/run_experiment.py`
    - `program.md`
 2. Verify the existance of data:
    - `Data/train.csv` training data
    - `Data/test.csv` testing data
    - `Data/sample_submission.csv` the final output from the script must be in this format
-3. Run the baseline once before making any changes.
-4. If `results.tsv` has no successful rows yet, treat the fresh baseline as the initial champion to beat.
+3. Activate the existing environment from the repo root:
+```bash
+source .venv/bin/activate
+```
+4. Run the baseline once through `scripts/run_experiment.py` before making model changes.
+5. If `results.tsv` has no successful rows yet, treat the fresh baseline as the initial champion to beat.
 
 ## Fixed evaluation protocol
 
 These rules are fixed unless the human explicitly changes them:
    - target: `Irrigation_Need`
-   - Validation split: `20% of the train.csv`
+   - Validation split: `15% of the train.csv`
    - split seed: `45`
    - metric: `validation balanced_accuracy_score` For more information about balanced_accuracy_score take a look at this url: `https://scikit-learn.org/stable/modules/generated/sklearn.metrics.balanced_accuracy_score.html`
    - More the `val_balanced_accuracy_score` is better
@@ -26,12 +31,21 @@ These rules are fixed unless the human explicitly changes them:
 
 Run:
 ```bash
-uv run scripts/solution.py > run.log 2>&1
+python scripts/run_experiment.py \
+  --run-name baseline_holdout_v1 \
+  --description "Initial 15% holdout CatBoost baseline." \
+  --model-config "CatBoost multiclass holdout baseline" \
+  --feature-config "raw features only"
 ```
 
 Then extract:
 ```bash
-grep "^val_balanced_accuracy_score:\|^best_iteration:" run.log
+grep "^val_balanced_accuracy_score:\|^best_iteration:\|^weakest_class_recall:" run.log
+```
+
+Low-level validation-only debug run:
+```bash
+python scripts/solution.py --skip-refit > run.log 2>&1
 ```
 
 After the baseline:
@@ -101,7 +115,8 @@ Always pull the next hypothesis from this ladder, top to bottom. Do not spend mo
    - `If we change X, balanced accuracy should improve because Y.`
 4. Spawn a coding worker.
 5. Give that worker clear ownership of:
-   - `solution.py`
+   - `scripts/solution.py`
+   - `scripts/run_experiment.py` when experiment bookkeeping or champion-safe writes change
    - optionally `README.md` or `program.md` if documentation needs to be updated
 6. Require the worker to return:
    - `val_balanced_accuracy_score`
@@ -127,10 +142,10 @@ The coding worker should:
    - keep the code changes
    - update `results.tsv` with the new champion
    - include the experiment hypothesis and the main recall change in `description`
+   - rerun through `scripts/run_experiment.py` so the champion write is staged safely before replacing the current prediction/model artifacts
    - Run the model on `test.csv` and save the output as shown in `sample_submission.csv` file in `Predictions` folder.
    - keep the file named `prediction_irr_need.csv`
-   - commit the improvement
-   - push to the main branch
+   - commit the improvement and push it to `origin/main` on `https://github.com/harshad317/Irrigation_need.git` once the winning change set is scoped to the champion run
 4. If the run does not improve:
    - do not keep the experiment
    - log it as `discard` or `crash`
@@ -157,7 +172,8 @@ Field guidance:
 
 ## What can change
 
-- feature engineering inside `solution.py`
+- experiment orchestration inside `scripts/run_experiment.py`
+- feature engineering inside `scripts/solution.py`
 - model hyperparameters
 - training logic
 - stacking, calibration, thresholding, and ensemble logic
@@ -173,7 +189,7 @@ Field guidance:
 
 ## Fallback mode
 
-`solution.py --autoloop` exists as a non-LLM fallback search loop. It is not the primary workflow. The preferred workflow is still:
+There is no `--autoloop` fallback in the lean setup. The local fallback loop is `scripts/run_experiment.py`, which still must respect the champion contract and the priority experiment ladder instead of doing pure random search. The preferred workflow is still:
 
 - `gpt-5.4` with `extra high` reasoning for research/control (lead agent)
 - `gpt-5.3-codex` with `extra high` reasoning for coding, committing, and pushing (coding worker)
@@ -183,3 +199,4 @@ If fallback mode is used, it should still respect the champion contract and the 
 ## Never stop
 
 Once the experiment loop begins, do not ask whether to continue. Keep researching, delegating, evaluating, and only preserving genuine improvements until the user manually stops the run.
+Use subagents, skills if needed.

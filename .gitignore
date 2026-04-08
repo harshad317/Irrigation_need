@@ -1,11 +1,15 @@
 .DS_Store
 .venv/
+.claude/
+.mplconfig/
 Data/
+Predictions/
 __pycache__/
 *.pyc
 run.log
 *.log
 results.tsv
-Predictions/
 catboost_info/
 cache/
+artifacts/*.cbm
+artifacts/*.json
