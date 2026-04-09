@@ -13,8 +13,9 @@ import pandas as pd
 from boruta import BorutaPy
 from catboost import CatBoostClassifier, Pool
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, recall_score
-from sklearn.model_selection import StratifiedShuffleSplit, train_test_split
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, train_test_split
 from sklearn.preprocessing import OrdinalEncoder
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -68,6 +69,11 @@ POSITIVE_PRUNING_PROBE_OVERRIDES = {
     "one_hot_max_size": 6,
     "verbose": False,
 }
+STACKING_SIGNAL_COLUMNS = [
+    "net_need_signal",
+    "peak_delivery_drought",
+    f"{CERTAIN_FEATURE_PREFIX}medium_peak_mulched_wetter",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -241,11 +247,49 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stacking-mode",
+        choices=["none", "catboost_triplet_logreg"],
+        default="none",
+        help=(
+            "Optional leakage-safe probability stacker. "
+            "`catboost_triplet_logreg` uses three CatBoost variants and a "
+            "multinomial logistic meta-learner."
+        ),
+    )
+    parser.add_argument(
+        "--stacking-folds",
+        type=int,
+        default=3,
+        help="Number of OOF folds used by the stacking meta-learner.",
+    )
+    parser.add_argument(
+        "--stacking-max-rows",
+        type=int,
+        default=220000,
+        help="Maximum number of outer-train rows used to fit the stacking meta-learner.",
+    )
+    parser.add_argument(
+        "--stacking-logreg-c",
+        type=float,
+        default=1.0,
+        help="Inverse regularization strength for the multinomial logistic stacker.",
+    )
+    parser.add_argument(
         "--skip-refit",
         action="store_true",
         help="Stop after validation instead of refitting on the full training set.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.stacking_mode != "none":
+        if args.ensemble_mode != "none":
+            raise SystemExit("Stacking mode cannot be combined with ensemble_mode.")
+        if args.class_scale_search:
+            raise SystemExit("Stacking mode cannot be combined with class_scale_search.")
+        if args.rule_overrides:
+            raise SystemExit("Stacking mode cannot be combined with rule_overrides.")
+        if args.stacking_folds < 2:
+            raise SystemExit("stacking_folds must be at least 2.")
+    return args
 
 
 def json_ready(payload: Any) -> Any:
@@ -934,6 +978,257 @@ def print_validation_summary(
     return per_class_recall
 
 
+def stacking_variant_specs() -> list[tuple[str, dict[str, Any]]]:
+    return [
+        ("mc", {}),
+        ("ova", {"loss_function": "MultiClassOneVsAll"}),
+        (
+            "shallow",
+            {
+                "depth": 6,
+                "l2_leaf_reg": 12.0,
+                "subsample": 0.95,
+                "min_data_in_leaf": 50,
+                "random_strength": 0.4,
+            },
+        ),
+    ]
+
+
+def merged_model_overrides(
+    base_overrides: dict[str, Any] | None,
+    extra_overrides: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    if base_overrides:
+        merged.update(base_overrides)
+    if extra_overrides:
+        merged.update(extra_overrides)
+    return merged
+
+
+def predict_aligned_probabilities(
+    model: CatBoostClassifier,
+    features: pd.DataFrame,
+    categorical_columns: list[str],
+    class_names: list[str],
+) -> np.ndarray:
+    probabilities = np.asarray(
+        model.predict_proba(build_pool(features, None, categorical_columns))
+    )
+    model_classes = [str(label) for label in model.classes_]
+    class_lookup = {label: index for index, label in enumerate(model_classes)}
+    aligned = np.zeros((len(features), len(class_names)), dtype=np.float32)
+    for index, label in enumerate(class_names):
+        aligned[:, index] = probabilities[:, class_lookup[label]]
+    return aligned
+
+
+def resolve_stacking_signal_columns(features: pd.DataFrame) -> list[str]:
+    return [column for column in STACKING_SIGNAL_COLUMNS if column in features.columns]
+
+
+def build_stacking_matrix(
+    probability_blocks: list[np.ndarray],
+    features: pd.DataFrame,
+    raw_signal_columns: list[str],
+) -> np.ndarray:
+    matrix_parts = [np.asarray(block, dtype=np.float32) for block in probability_blocks]
+    if raw_signal_columns:
+        raw_block = (
+            features[raw_signal_columns]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+            .to_numpy(dtype=np.float32)
+        )
+        matrix_parts.append(raw_block)
+    return np.hstack(matrix_parts).astype(np.float32, copy=False)
+
+
+def fit_stacking_bundle(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    categorical_columns: list[str],
+    class_names: list[str],
+    args: argparse.Namespace,
+    base_model_overrides: dict[str, Any] | None = None,
+    primary_model: CatBoostClassifier | None = None,
+    reference_features: pd.DataFrame | None = None,
+    reference_labels: pd.Series | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if args.stacking_mode == "none":
+        return None, {"enabled": False, "mode": args.stacking_mode}
+
+    sample_limit = len(x_train) if args.stacking_max_rows <= 0 else args.stacking_max_rows
+    stack_x_train, stack_y_train = stratified_subsample(
+        x_train,
+        y_train,
+        max_rows=sample_limit,
+        random_state=args.random_state + 59,
+    )
+    stack_x_train = stack_x_train.reset_index(drop=True)
+    stack_y_train = stack_y_train.reset_index(drop=True)
+
+    variant_specs = stacking_variant_specs()
+    oof_probability_blocks = [
+        np.zeros((len(stack_x_train), len(class_names)), dtype=np.float32)
+        for _ in variant_specs
+    ]
+    fold_best_iterations: dict[str, list[int]] = {
+        name: [] for name, _ in variant_specs
+    }
+    fold_scores: list[dict[str, Any]] = []
+    splitter = StratifiedKFold(
+        n_splits=args.stacking_folds,
+        shuffle=True,
+        random_state=args.random_state + 59,
+    )
+
+    for fold_index, (fold_train_idx, fold_oof_idx) in enumerate(
+        splitter.split(stack_x_train, stack_y_train),
+        start=1,
+    ):
+        fold_train_x = stack_x_train.iloc[fold_train_idx].reset_index(drop=True)
+        fold_train_y = stack_y_train.iloc[fold_train_idx].reset_index(drop=True)
+        fold_oof_x = stack_x_train.iloc[fold_oof_idx].reset_index(drop=True)
+        fold_oof_y = stack_y_train.iloc[fold_oof_idx].reset_index(drop=True)
+        fold_train_pool = build_pool(fold_train_x, fold_train_y, categorical_columns)
+        fold_oof_pool = build_pool(fold_oof_x, fold_oof_y, categorical_columns)
+
+        for block_index, (variant_name, variant_overrides) in enumerate(variant_specs):
+            fold_model = CatBoostClassifier(
+                **build_model_params(
+                    args,
+                    overrides=merged_model_overrides(
+                        base_model_overrides,
+                        variant_overrides,
+                    ),
+                )
+            )
+            fold_model.fit(
+                fold_train_pool,
+                eval_set=fold_oof_pool,
+                use_best_model=True,
+                early_stopping_rounds=args.early_stopping_rounds,
+            )
+            oof_probability_blocks[block_index][fold_oof_idx] = predict_aligned_probabilities(
+                fold_model,
+                fold_oof_x,
+                categorical_columns,
+                class_names,
+            )
+            best_iteration = resolved_best_iteration(fold_model)
+            fold_best_iterations[variant_name].append(best_iteration)
+            fold_predictions = flatten_predictions(fold_model.predict(fold_oof_pool))
+            fold_scores.append(
+                {
+                    "fold": fold_index,
+                    "variant": variant_name,
+                    "score": float(balanced_accuracy_score(fold_oof_y, fold_predictions)),
+                    "best_iteration": best_iteration,
+                }
+            )
+
+    raw_signal_columns = resolve_stacking_signal_columns(stack_x_train)
+    meta_train_matrix = build_stacking_matrix(
+        oof_probability_blocks,
+        stack_x_train,
+        raw_signal_columns,
+    )
+    meta_model = LogisticRegression(
+        solver="lbfgs",
+        max_iter=1000,
+        class_weight="balanced",
+        C=args.stacking_logreg_c,
+    )
+    meta_model.fit(meta_train_matrix, stack_y_train)
+
+    full_models: dict[str, CatBoostClassifier] = {}
+    refit_iterations: dict[str, int] = {}
+    for variant_name, variant_overrides in variant_specs:
+        if variant_name == "mc" and primary_model is not None:
+            full_models[variant_name] = primary_model
+            refit_iterations[variant_name] = int(primary_model.tree_count_)
+            continue
+
+        full_overrides = merged_model_overrides(base_model_overrides, variant_overrides)
+        if reference_features is None or reference_labels is None:
+            average_best_iteration = int(
+                np.mean(fold_best_iterations[variant_name])
+            ) if fold_best_iterations[variant_name] else int(args.iterations // 2)
+            full_overrides["iterations"] = max(1, average_best_iteration + 1)
+            full_model = CatBoostClassifier(
+                **build_model_params(args, overrides=full_overrides)
+            )
+            full_model.fit(build_pool(x_train, y_train, categorical_columns))
+        else:
+            full_model = CatBoostClassifier(
+                **build_model_params(args, overrides=full_overrides)
+            )
+            full_model.fit(
+                build_pool(x_train, y_train, categorical_columns),
+                eval_set=build_pool(
+                    reference_features,
+                    reference_labels,
+                    categorical_columns,
+                ),
+                use_best_model=True,
+                early_stopping_rounds=args.early_stopping_rounds,
+            )
+        full_models[variant_name] = full_model
+        refit_iterations[variant_name] = int(full_model.tree_count_)
+
+    summary = {
+        "enabled": True,
+        "mode": args.stacking_mode,
+        "sample_rows": len(stack_x_train),
+        "folds": args.stacking_folds,
+        "logreg_c": args.stacking_logreg_c,
+        "variant_names": [name for name, _ in variant_specs],
+        "raw_signal_columns": raw_signal_columns,
+        "meta_feature_count": int(meta_train_matrix.shape[1]),
+        "oof_fold_scores": fold_scores,
+        "refit_iterations": refit_iterations,
+    }
+    return (
+        {
+            "mode": args.stacking_mode,
+            "variant_names": [name for name, _ in variant_specs],
+            "class_names": class_names[:],
+            "categorical_columns": categorical_columns[:],
+            "raw_signal_columns": raw_signal_columns,
+            "models": full_models,
+            "meta_model": meta_model,
+            "refit_iterations": refit_iterations,
+        },
+        summary,
+    )
+
+
+def predict_with_stacking_bundle(
+    features: pd.DataFrame,
+    bundle: dict[str, Any],
+) -> np.ndarray:
+    class_names = list(bundle["class_names"])
+    categorical_columns = list(bundle["categorical_columns"])
+    probability_blocks = [
+        predict_aligned_probabilities(
+            bundle["models"][variant_name],
+            features,
+            categorical_columns,
+            class_names,
+        )
+        for variant_name in bundle["variant_names"]
+    ]
+    meta_matrix = build_stacking_matrix(
+        probability_blocks,
+        features,
+        list(bundle["raw_signal_columns"]),
+    )
+    predictions = bundle["meta_model"].predict(meta_matrix)
+    return np.asarray(predictions, dtype=object)
+
+
 def predict_with_class_scales(
     probabilities: np.ndarray,
     class_labels: list[str],
@@ -1174,7 +1469,16 @@ def predict_labels(
     rule_overrides: list[dict[str, Any]],
     args: argparse.Namespace,
     ensemble_bundle: dict[str, Any] | None = None,
+    stacking_bundle: dict[str, Any] | None = None,
 ) -> np.ndarray:
+    if stacking_bundle is not None:
+        predictions = predict_with_stacking_bundle(features, stacking_bundle)
+        return apply_rule_overrides(
+            predictions=predictions,
+            features=features,
+            rules=rule_overrides,
+        )
+
     feature_pool = build_pool(features, None, categorical_columns)
     class_labels = [str(label) for label in model.classes_]
     probabilities = np.asarray(model.predict_proba(feature_pool))
@@ -1744,10 +2048,12 @@ def fit_validation_model(
 ) -> tuple[
     CatBoostClassifier,
     dict[str, Any] | None,
+    dict[str, Any] | None,
     float,
     dict[str, float],
     list[dict[str, Any]],
     dict[str, float],
+    dict[str, Any],
 ]:
     model = CatBoostClassifier(**build_model_params(args, overrides=model_overrides))
     train_pool = build_pool(x_train, y_train, categorical_columns)
@@ -1760,25 +2066,44 @@ def fit_validation_model(
         early_stopping_rounds=args.early_stopping_rounds,
     )
 
-    ensemble_bundle = fit_extra_trees_bundle(
-        features=x_train,
-        labels=y_train,
-        categorical_columns=categorical_columns,
-        args=args,
-    )
-    class_scales = learn_class_scale_map(
-        x_train=x_train,
-        y_train=y_train,
-        categorical_columns=categorical_columns,
-        args=args,
-        model_overrides=model_overrides,
-    )
-    rule_overrides = learn_rule_overrides(
-        features=x_train,
-        labels=y_train,
-        class_names=class_names,
-        args=args,
-    )
+    stacking_bundle: dict[str, Any] | None = None
+    stacking_summary: dict[str, Any] = {"enabled": False, "mode": args.stacking_mode}
+    ensemble_bundle: dict[str, Any] | None = None
+    class_scales: dict[str, float] = {}
+    rule_overrides: list[dict[str, Any]] = []
+    if args.stacking_mode == "none":
+        ensemble_bundle = fit_extra_trees_bundle(
+            features=x_train,
+            labels=y_train,
+            categorical_columns=categorical_columns,
+            args=args,
+        )
+        class_scales = learn_class_scale_map(
+            x_train=x_train,
+            y_train=y_train,
+            categorical_columns=categorical_columns,
+            args=args,
+            model_overrides=model_overrides,
+        )
+        rule_overrides = learn_rule_overrides(
+            features=x_train,
+            labels=y_train,
+            class_names=class_names,
+            args=args,
+        )
+    else:
+        stacking_bundle, stacking_summary = fit_stacking_bundle(
+            x_train=x_train,
+            y_train=y_train,
+            categorical_columns=categorical_columns,
+            class_names=class_names,
+            args=args,
+            base_model_overrides=model_overrides,
+            primary_model=model,
+            reference_features=x_val,
+            reference_labels=y_val,
+        )
+
     validation_predictions = predict_labels(
         model=model,
         features=x_val,
@@ -1787,6 +2112,7 @@ def fit_validation_model(
         rule_overrides=rule_overrides,
         args=args,
         ensemble_bundle=ensemble_bundle,
+        stacking_bundle=stacking_bundle,
     )
     balanced_accuracy = balanced_accuracy_score(y_val, validation_predictions)
     if ensemble_bundle is not None:
@@ -1798,6 +2124,7 @@ def fit_validation_model(
             rule_overrides=rule_overrides,
             args=argparse.Namespace(**{**vars(args), "ensemble_mode": "none"}),
             ensemble_bundle=None,
+            stacking_bundle=None,
         )
         base_score = balanced_accuracy_score(y_val, base_predictions)
         changed_predictions = int(
@@ -1806,6 +2133,17 @@ def fit_validation_model(
         print(f"ensemble_mode: {args.ensemble_mode}")
         print(f"ensemble_base_catboost_score: {base_score:.10f}")
         print(f"ensemble_changed_predictions: {changed_predictions}")
+    if stacking_bundle is not None:
+        print(f"stacking_mode: {args.stacking_mode}")
+        print(f"stacking_sample_rows: {stacking_summary['sample_rows']}")
+        print(f"stacking_folds: {stacking_summary['folds']}")
+        print(f"stacking_logreg_c: {stacking_summary['logreg_c']}")
+        print("stacking_variants: " + ", ".join(stacking_summary["variant_names"]))
+        if stacking_summary["raw_signal_columns"]:
+            print(
+                "stacking_raw_signals: "
+                + ", ".join(stacking_summary["raw_signal_columns"])
+            )
     best_iteration = resolved_best_iteration(model)
     tree_count = int(model.tree_count_)
 
@@ -1824,10 +2162,12 @@ def fit_validation_model(
     return (
         model,
         ensemble_bundle,
+        stacking_bundle,
         float(balanced_accuracy),
         per_class_recall,
         rule_overrides,
         class_scales,
+        stacking_summary,
     )
 
 
@@ -1860,6 +2200,7 @@ def write_submission(
     rule_overrides: list[dict[str, Any]],
     class_scales: dict[str, float],
     ensemble_bundle: dict[str, Any] | None,
+    stacking_bundle: dict[str, Any] | None,
     args: argparse.Namespace,
 ) -> None:
     submission_df = pd.read_csv(args.sample_submission_path)
@@ -1879,6 +2220,7 @@ def write_submission(
         rule_overrides=rule_overrides,
         args=args,
         ensemble_bundle=ensemble_bundle,
+        stacking_bundle=stacking_bundle,
     )
 
     submission_df[args.id_column] = test_df[args.id_column].to_numpy()
@@ -1978,10 +2320,12 @@ def main() -> None:
     (
         validation_model,
         validation_ensemble_bundle,
+        validation_stacking_bundle,
         balanced_accuracy,
         per_class_recall,
         rule_overrides,
         class_scales,
+        stacking_summary,
     ) = fit_validation_model(
         x_train=x_train[selected_features],
         y_train=y_train,
@@ -2011,6 +2355,7 @@ def main() -> None:
         "boruta": boruta_summary,
         "optuna": tuning_summary,
         "ensemble": ensemble_summary,
+        "stacking": stacking_summary,
         "rule_overrides": rule_overrides,
         "class_scales": class_scales,
         "feature_columns": selected_features,
@@ -2040,32 +2385,51 @@ def main() -> None:
         args=args,
         model_overrides=tuning_overrides or None,
     )
-    full_ensemble_bundle = fit_extra_trees_bundle(
-        features=train_df[selected_features],
-        labels=train_df[args.target_column],
-        categorical_columns=selected_categorical_columns,
-        args=args,
-    )
-    full_rule_overrides = learn_rule_overrides(
-        features=train_df[selected_features],
-        labels=train_df[args.target_column],
-        class_names=class_names,
-        args=args,
-    )
-    full_class_scales = learn_class_scale_map(
-        x_train=train_df[selected_features],
-        y_train=train_df[args.target_column],
-        categorical_columns=selected_categorical_columns,
-        args=args,
-        model_overrides=tuning_overrides or None,
-    )
+    full_stacking_bundle: dict[str, Any] | None = None
+    full_ensemble_bundle: dict[str, Any] | None = None
+    full_rule_overrides: list[dict[str, Any]] = []
+    full_class_scales: dict[str, float] = {}
+    full_stacking_summary = {"enabled": False, "mode": args.stacking_mode}
+    if args.stacking_mode == "none":
+        full_ensemble_bundle = fit_extra_trees_bundle(
+            features=train_df[selected_features],
+            labels=train_df[args.target_column],
+            categorical_columns=selected_categorical_columns,
+            args=args,
+        )
+        full_rule_overrides = learn_rule_overrides(
+            features=train_df[selected_features],
+            labels=train_df[args.target_column],
+            class_names=class_names,
+            args=args,
+        )
+        full_class_scales = learn_class_scale_map(
+            x_train=train_df[selected_features],
+            y_train=train_df[args.target_column],
+            categorical_columns=selected_categorical_columns,
+            args=args,
+            model_overrides=tuning_overrides or None,
+        )
+    else:
+        full_stacking_bundle, full_stacking_summary = fit_stacking_bundle(
+            x_train=train_df[selected_features],
+            y_train=train_df[args.target_column],
+            categorical_columns=selected_categorical_columns,
+            class_names=class_names,
+            args=args,
+            base_model_overrides=tuning_overrides or None,
+            primary_model=full_model,
+        )
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
     full_model.save_model(args.model_path)
     print(f"saved_model_path: {args.model_path}")
-    if full_ensemble_bundle is not None:
+    if full_ensemble_bundle is not None or full_stacking_bundle is not None:
         args.ensemble_artifact_path.parent.mkdir(parents=True, exist_ok=True)
         with args.ensemble_artifact_path.open("wb") as handle:
-            pickle.dump(full_ensemble_bundle, handle)
+            pickle.dump(
+                full_stacking_bundle if full_stacking_bundle is not None else full_ensemble_bundle,
+                handle,
+            )
         print(f"saved_ensemble_artifact_path: {args.ensemble_artifact_path}")
 
     raw_test_df = pd.read_csv(args.test_path)
@@ -2078,6 +2442,7 @@ def main() -> None:
         rule_overrides=full_rule_overrides,
         class_scales=full_class_scales,
         ensemble_bundle=full_ensemble_bundle,
+        stacking_bundle=full_stacking_bundle,
         args=args,
     )
 
@@ -2085,8 +2450,11 @@ def main() -> None:
     metadata["refit_iterations"] = int(validation_model.tree_count_)
     metadata["full_rule_overrides"] = full_rule_overrides
     metadata["full_class_scales"] = full_class_scales
+    metadata["full_stacking"] = full_stacking_summary
     if full_ensemble_bundle is not None:
         metadata["ensemble"]["saved_artifact_path"] = str(args.ensemble_artifact_path)
+    if full_stacking_bundle is not None:
+        metadata["stacking"]["saved_artifact_path"] = str(args.ensemble_artifact_path)
     save_json(metadata, args.metadata_path)
     print(f"saved_metadata_path: {args.metadata_path}")
 
