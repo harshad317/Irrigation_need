@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ RUN_LOG_PATH = ROOT / "run.log"
 RESULTS_PATH = ROOT / "results.tsv"
 PREDICTION_PATH = ROOT / "Predictions" / "prediction_irr_need.csv"
 MODEL_PATH = ROOT / "artifacts" / "irrigation_need_catboost.cbm"
+ENSEMBLE_ARTIFACT_PATH = ROOT / "artifacts" / "irrigation_need_extra_trees.pkl"
 METADATA_PATH = ROOT / "artifacts" / "irrigation_need_metadata.json"
 RESULTS_HEADER = [
     "timestamp",
@@ -37,6 +39,7 @@ RUNNER_OWNED_ARGS = {
     "--skip-refit",
     "--submission-path",
     "--model-path",
+    "--ensemble-artifact-path",
     "--metadata-path",
 }
 SCORE_EPSILON = 1e-12
@@ -206,7 +209,7 @@ def crash_reason(log_path: Path, returncode: int) -> str:
 
 def run_solution(args: list[str], log_path: Path) -> tuple[int, Path]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, str(SOLUTION_PATH), *args]
+    command = [sys.executable, "-u", str(SOLUTION_PATH), *args]
     with log_path.open("w", encoding="utf-8") as handle:
         completed = subprocess.run(
             command,
@@ -293,6 +296,21 @@ def crash_description(base_description: str, reason: str) -> str:
 def require_file(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Expected artifact was not created: {path}")
+
+
+def ensemble_mode_from_metadata(path: Path) -> str:
+    if not path.exists():
+        return "none"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "none"
+    ensemble = payload.get("ensemble")
+    if isinstance(ensemble, dict):
+        mode = ensemble.get("mode")
+        if isinstance(mode, str) and mode:
+            return mode
+    return "none"
 
 
 def main() -> None:
@@ -385,6 +403,7 @@ def main() -> None:
 
         submission_temp = temp_dir / "prediction_irr_need.csv"
         model_temp = temp_dir / "irrigation_need_catboost.cbm"
+        ensemble_temp = temp_dir / "irrigation_need_extra_trees.pkl"
         metadata_temp = temp_dir / "irrigation_need_metadata.json"
         full_run_args = [
             *args.solution_args,
@@ -392,6 +411,8 @@ def main() -> None:
             str(submission_temp),
             "--model-path",
             str(model_temp),
+            "--ensemble-artifact-path",
+            str(ensemble_temp),
             "--metadata-path",
             str(metadata_temp),
         ]
@@ -459,11 +480,18 @@ def main() -> None:
             return
 
         try:
+            ensemble_mode = ensemble_mode_from_metadata(metadata_temp)
             require_file(submission_temp)
             require_file(model_temp)
             require_file(metadata_temp)
+            if ensemble_mode != "none":
+                require_file(ensemble_temp)
             replace_file(submission_temp, PREDICTION_PATH)
             replace_file(model_temp, MODEL_PATH)
+            if ensemble_mode != "none":
+                replace_file(ensemble_temp, ENSEMBLE_ARTIFACT_PATH)
+            elif ENSEMBLE_ARTIFACT_PATH.exists():
+                ENSEMBLE_ARTIFACT_PATH.unlink()
             replace_file(metadata_temp, METADATA_PATH)
         except (FileNotFoundError, OSError) as exc:
             append_result(
@@ -506,6 +534,8 @@ def main() -> None:
         print(f"run_log_path: {full_log_path}")
         print(f"submission_path: {PREDICTION_PATH}")
         print(f"model_path: {MODEL_PATH}")
+        if ENSEMBLE_ARTIFACT_PATH.exists():
+            print(f"ensemble_artifact_path: {ENSEMBLE_ARTIFACT_PATH}")
         print(f"metadata_path: {METADATA_PATH}")
         print(f"results_path: {RESULTS_PATH}")
 

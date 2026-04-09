@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -10,12 +12,13 @@ import optuna
 import pandas as pd
 from boruta import BorutaPy
 from catboost import CatBoostClassifier, Pool
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, recall_score
 from sklearn.model_selection import StratifiedShuffleSplit, train_test_split
 from sklearn.preprocessing import OrdinalEncoder
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+warnings.simplefilter("ignore", category=pd.errors.PerformanceWarning)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_PATH = REPO_ROOT / "Data" / "train.csv"
@@ -23,11 +26,48 @@ DEFAULT_TEST_PATH = REPO_ROOT / "Data" / "test.csv"
 DEFAULT_SAMPLE_SUBMISSION_PATH = REPO_ROOT / "Data" / "sample_submission.csv"
 DEFAULT_SUBMISSION_PATH = REPO_ROOT / "Predictions" / "prediction_irr_need.csv"
 DEFAULT_MODEL_PATH = REPO_ROOT / "artifacts" / "irrigation_need_catboost.cbm"
+DEFAULT_ENSEMBLE_ARTIFACT_PATH = REPO_ROOT / "artifacts" / "irrigation_need_extra_trees.pkl"
 DEFAULT_METADATA_PATH = REPO_ROOT / "artifacts" / "irrigation_need_metadata.json"
 TARGET_ORDER = ["Low", "Medium", "High"]
 PEAK_STAGES = {"Vegetative", "Flowering"}
 BORUTA_RF_TREES = 400
 BORUTA_RF_DEPTH = 8
+CERTAIN_FEATURE_PREFIX = "certain_"
+STAGE_WATER_DEMAND = {
+    "Sowing": 0.92,
+    "Vegetative": 1.12,
+    "Flowering": 1.22,
+    "Harvest": 0.82,
+}
+IRRIGATION_DELIVERY_FACTOR = {
+    "Drip": 1.16,
+    "Sprinkler": 1.04,
+    "Canal": 0.92,
+    "Rainfed": 0.80,
+}
+WATER_SOURCE_STABILITY = {
+    "Groundwater": 1.05,
+    "Reservoir": 1.00,
+    "River": 0.95,
+    "Rainwater": 0.88,
+}
+MULCH_DEMAND_FACTOR = {
+    "Yes": 0.88,
+    "No": 1.00,
+    "Missing": 1.00,
+}
+POSITIVE_PRUNING_PROBE_OVERRIDES = {
+    "iterations": 450,
+    "learning_rate": 0.06,
+    "depth": 7,
+    "l2_leaf_reg": 8.0,
+    "subsample": 0.85,
+    "min_data_in_leaf": 24,
+    "random_strength": 0.75,
+    "border_count": 128,
+    "one_hot_max_size": 6,
+    "verbose": False,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--submission-path", type=Path, default=DEFAULT_SUBMISSION_PATH)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument(
+        "--ensemble-artifact-path",
+        type=Path,
+        default=DEFAULT_ENSEMBLE_ARTIFACT_PATH,
+    )
     parser.add_argument("--metadata-path", type=Path, default=DEFAULT_METADATA_PATH)
     parser.add_argument("--target-column", default="Irrigation_Need")
     parser.add_argument("--id-column", default="id")
@@ -76,6 +121,14 @@ def parse_args() -> argparse.Namespace:
         "--boruta",
         action="store_true",
         help="Run Boruta feature selection on the training split only.",
+    )
+    parser.add_argument(
+        "--boruta-positive-pruning",
+        action="store_true",
+        help=(
+            "After Boruta, keep only selected engineered numeric features with "
+            "positive permutation contribution on an inner training calibration split."
+        ),
     )
     parser.add_argument(
         "--class-scale-search",
@@ -118,6 +171,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum Boruta iterations.",
     )
     parser.add_argument(
+        "--positive-pruning-max-rows",
+        type=int,
+        default=30000,
+        help="Maximum number of training rows used for post-Boruta contribution pruning.",
+    )
+    parser.add_argument(
         "--boruta-perc",
         type=int,
         default=85,
@@ -145,6 +204,41 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=220000,
         help="Maximum number of training rows used during hyperparameter search.",
+    )
+    parser.add_argument(
+        "--ensemble-mode",
+        choices=["none", "cat_high_else_extra"],
+        default="none",
+        help=(
+            "Optional selector ensemble that keeps CatBoost High predictions and "
+            "delegates other rows to ExtraTrees."
+        ),
+    )
+    parser.add_argument(
+        "--extra-trees-estimators",
+        type=int,
+        default=700,
+        help="Number of trees for the ExtraTrees sidecar used by ensemble mode.",
+    )
+    parser.add_argument(
+        "--extra-trees-max-depth",
+        type=int,
+        default=24,
+        help="Maximum depth for the ExtraTrees sidecar. Use 0 for unlimited depth.",
+    )
+    parser.add_argument(
+        "--extra-trees-min-samples-leaf",
+        type=int,
+        default=1,
+        help="Minimum samples per leaf for the ExtraTrees sidecar.",
+    )
+    parser.add_argument(
+        "--extra-trees-max-features",
+        default="sqrt",
+        help=(
+            "Value passed to ExtraTreesClassifier(max_features). "
+            "Examples: sqrt, log2, 0.4, 1.0."
+        ),
     )
     parser.add_argument(
         "--skip-refit",
@@ -194,15 +288,63 @@ def engineer_features(frame: pd.DataFrame, enabled: bool) -> pd.DataFrame:
     conductivity = df["Electrical_Conductivity"].astype(float)
     organic_carbon = df["Organic_Carbon"].astype(float)
     soil_ph = df["Soil_pH"].astype(float)
+    soil_type = df["Soil_Type"].astype("string").fillna("Missing")
+    crop_type = df["Crop_Type"].astype("string").fillna("Missing")
+    region = df["Region"].astype("string").fillna("Missing")
 
     water_in = rainfall + previous_irrigation
     humidity_relief = np.clip(1.0 - humidity / 100.0, 0.05, None)
     area_safe = area + 0.1
     soil_safe = soil_moisture + 1.0
     rain_safe = rainfall + 1.0
+    per_ha_water_in = water_in / area_safe
+    saturation_vapor_pressure = 0.6108 * np.exp(
+        (17.27 * temperature) / (temperature + 237.3)
+    )
+    wind_root = np.sqrt(np.clip(wind, 0.0, None) + 1.0)
+    sunlight_plus = np.clip(sunlight, 0.0, None) + 1.0
 
     peak_stage = df["Crop_Growth_Stage"].isin(PEAK_STAGES)
+    growth_stage = df["Crop_Growth_Stage"].astype("string").fillna("Missing")
     no_mulch = df["Mulching_Used"].astype("string").fillna("Missing").eq("No")
+    mulch_used = df["Mulching_Used"].astype("string").fillna("Missing")
+    mulch_yes = mulch_used.eq("Yes")
+    harvest_stage = growth_stage.eq("Harvest")
+    sowing_stage = growth_stage.eq("Sowing")
+    non_peak_stage = harvest_stage | sowing_stage
+    water_source = df["Water_Source"].astype("string").fillna("Missing")
+    irrigation_type = df["Irrigation_Type"].astype("string").fillna("Missing")
+    season = df["Season"].astype("string").fillna("Missing")
+    river_source = water_source.eq("River")
+    canal_irrigation = irrigation_type.eq("Canal")
+    rainfed_irrigation = irrigation_type.eq("Rainfed")
+    drip_irrigation = irrigation_type.eq("Drip")
+    kharif_season = season.eq("Kharif")
+    stage_demand_factor = growth_stage.map(STAGE_WATER_DEMAND).fillna(1.0).astype(float)
+    irrigation_delivery = (
+        irrigation_type.map(IRRIGATION_DELIVERY_FACTOR).fillna(1.0).astype(float)
+    )
+    source_stability = (
+        water_source.map(WATER_SOURCE_STABILITY).fillna(1.0).astype(float)
+    )
+    mulch_demand_factor = (
+        mulch_used.map(MULCH_DEMAND_FACTOR).fillna(1.0).astype(float)
+    )
+    effective_irrigation = previous_irrigation * irrigation_delivery * source_stability
+    effective_water_input = rainfall + effective_irrigation
+    adjusted_et_demand = (
+        safe_ratio(
+            temperature * sunlight * (1.0 + wind / 10.0),
+            humidity + 1.0,
+            offset=0.0,
+        )
+        * stage_demand_factor
+        * mulch_demand_factor
+    )
+    soil_mid_25_40 = (soil_moisture > 25.0) & (soil_moisture <= 40.0)
+    temp_30_35 = (temperature > 30.0) & (temperature <= 35.0)
+    wind_10_15 = (wind > 10.0) & (wind <= 15.0)
+    rain_500_1200 = (rainfall > 500.0) & (rainfall <= 1200.0)
 
     df["water_in"] = water_in
     df["water_in_log"] = np.log1p(water_in)
@@ -210,45 +352,217 @@ def engineer_features(frame: pd.DataFrame, enabled: bool) -> pd.DataFrame:
     df["prev_irrigation_log"] = np.log1p(previous_irrigation)
     df["field_area_log"] = np.log1p(area)
     df["moisture_deficit_20"] = np.clip(20.0 - soil_moisture, 0.0, None)
+    df["moisture_deficit_18"] = np.clip(18.0 - soil_moisture, 0.0, None)
+    df["moisture_deficit_22"] = np.clip(22.0 - soil_moisture, 0.0, None)
     df["moisture_deficit_25"] = np.clip(25.0 - soil_moisture, 0.0, None)
     df["moisture_deficit_30"] = np.clip(30.0 - soil_moisture, 0.0, None)
     df["moisture_le_25"] = (soil_moisture <= 25.0).astype(int)
     df["moisture_le_20"] = (soil_moisture <= 20.0).astype(int)
+    df["moisture_le_22"] = (soil_moisture <= 22.0).astype(int)
+    df["moisture_le_18"] = (soil_moisture <= 18.0).astype(int)
+    df["rain_le_200"] = (rainfall <= 200.0).astype(int)
+    df["rain_le_250"] = (rainfall <= 250.0).astype(int)
     df["rain_le_300"] = (rainfall <= 300.0).astype(int)
     df["rain_le_353"] = (rainfall <= 353.0).astype(int)
     df["rain_le_500"] = (rainfall <= 500.0).astype(int)
     df["temp_gt_30"] = (temperature > 30.0).astype(int)
     df["temp_gt_32"] = (temperature > 32.0).astype(int)
+    df["temp_gt_35"] = (temperature > 35.0).astype(int)
     df["wind_gt_10"] = (wind > 10.0).astype(int)
     df["wind_gt_12"] = (wind > 12.0).astype(int)
+    df["wind_gt_15"] = (wind > 15.0).astype(int)
     df["no_mulch"] = no_mulch.astype(int)
+    df["mulch_yes"] = mulch_yes.astype(int)
+    df["is_harvest"] = harvest_stage.astype(int)
+    df["is_sowing"] = sowing_stage.astype(int)
+    df["stage_demand_factor"] = stage_demand_factor
+    df["irrigation_delivery_factor"] = irrigation_delivery
+    df["water_source_stability"] = source_stability
+    df["mulch_demand_factor"] = mulch_demand_factor
     df["dryness_ratio"] = safe_ratio(temperature + wind, soil_safe, offset=0.0)
+    df["water_stress"] = safe_ratio(temperature, soil_safe * rain_safe, offset=0.0)
     df["heat_wind_pressure"] = temperature * (1.0 + wind / 10.0)
+    df["heat_index"] = temperature * humidity / 100.0
     df["et_proxy"] = (
         temperature
         * sunlight
         * (1.0 + wind / 10.0)
         * humidity_relief
     )
+    df["evapotranspiration_proxy"] = safe_ratio(
+        temperature * sunlight,
+        humidity + 1.0,
+        offset=0.0,
+    )
+    df["heat_stress"] = temperature * humidity_relief
     df["net_water_stress"] = df["et_proxy"] - np.log1p(water_in)
     df["water_stress_ratio"] = safe_ratio(df["et_proxy"], np.log1p(water_in), offset=1.0)
+    df["effective_rain"] = rainfall * np.clip(1.0 - soil_moisture / 100.0, 0.0, None)
     df["rain_per_ha"] = safe_ratio(rainfall, area, offset=0.1)
     df["prev_irr_per_ha"] = safe_ratio(previous_irrigation, area, offset=0.1)
     df["water_in_per_ha"] = safe_ratio(water_in, area, offset=0.1)
     df["irrigation_reliance"] = safe_ratio(previous_irrigation, water_in, offset=1.0)
     df["aridity_temp"] = safe_ratio(temperature, rainfall, offset=1.0)
     df["aridity_wind"] = safe_ratio(wind, rainfall, offset=1.0)
+    df["aridity_index"] = safe_ratio(temperature * wind, rainfall, offset=1.0)
     df["soil_heat_gap"] = temperature - soil_moisture
     df["humidity_soil_gap"] = humidity - soil_moisture
+    df["moisture_deficit_total"] = 100.0 - soil_moisture
+    df["dry_heat"] = temperature * df["moisture_deficit_total"] / 100.0
+    df["wind_heat"] = temperature * wind
+    df["drought_pressure"] = safe_ratio(
+        df["moisture_deficit_total"] * (temperature + wind),
+        rainfall + 10.0,
+        offset=0.0,
+    )
+    df["rainfall_relief"] = safe_ratio(rainfall, temperature + wind, offset=1.0)
+    df["prev_vs_rain"] = safe_ratio(previous_irrigation, rainfall, offset=10.0)
     df["soil_temp_interaction"] = soil_moisture * temperature
     df["soil_wind_interaction"] = soil_moisture * wind
     df["rain_irrigation_product"] = rainfall * previous_irrigation
     df["salinity_organic_ratio"] = safe_ratio(conductivity, organic_carbon, offset=0.1)
     df["soil_quality_index"] = safe_ratio(organic_carbon, conductivity, offset=1.0)
+    df["soil_health"] = safe_ratio(organic_carbon * soil_moisture, conductivity, offset=0.1)
+    df["salinity_risk"] = safe_ratio(conductivity * temperature, rainfall, offset=1.0)
+    df["ph_deviation"] = np.abs(soil_ph - 6.5)
     df["ph_ec_product"] = soil_ph * conductivity
+    df["moisture_retention"] = soil_moisture * organic_carbon
+    df["mulch_flag"] = mulch_yes.astype(float)
+    df["mulch_moisture_buffer"] = soil_moisture * (1.0 + 0.5 * df["mulch_flag"])
+    df["mulch_et_saving"] = df["evapotranspiration_proxy"] * (1.0 - 0.3 * df["mulch_flag"])
+    df["effective_irrigation_mm"] = effective_irrigation
+    df["effective_irrigation_log"] = np.log1p(effective_irrigation)
+    df["effective_water_input"] = effective_water_input
+    df["effective_water_log"] = np.log1p(effective_water_input)
+    df["effective_water_per_ha"] = safe_ratio(effective_water_input, area, offset=0.1)
+    df["adjusted_et_demand"] = adjusted_et_demand
+    df["adjusted_et_log"] = np.log1p(adjusted_et_demand)
+    df["stage_adjusted_moisture"] = safe_ratio(
+        soil_moisture,
+        stage_demand_factor,
+        offset=0.0,
+    )
+    df["stage_adjusted_water_in_per_ha"] = safe_ratio(
+        df["effective_water_per_ha"],
+        stage_demand_factor,
+        offset=0.0,
+    )
+    df["effective_supply_demand_ratio"] = safe_ratio(
+        np.log1p(effective_water_input),
+        np.log1p(adjusted_et_demand),
+        offset=1.0,
+    )
+    df["adjusted_supply_gap"] = adjusted_et_demand - np.log1p(effective_water_input)
+    df["soil_buffered_adjusted_gap"] = safe_ratio(
+        adjusted_et_demand,
+        soil_safe,
+        offset=0.0,
+    ) - np.log1p(effective_water_input)
+    df["delivery_adjusted_prev_irr_per_ha"] = safe_ratio(
+        effective_irrigation,
+        area,
+        offset=0.1,
+    )
+    df["stage_delivery_drought"] = safe_ratio(
+        df["drought_pressure"] * stage_demand_factor,
+        irrigation_delivery * source_stability,
+        offset=0.1,
+    )
+    df["peak_delivery_drought"] = df["stage_delivery_drought"] * peak_stage.astype(float)
+    df["non_peak_heat_wind"] = df["heat_wind_pressure"] * non_peak_stage.astype(float)
+    df["peak_no_mulch_supply_gap"] = df["adjusted_supply_gap"] * (
+        peak_stage & no_mulch
+    ).astype(float)
+    df["rainfed_stage_gap"] = df["adjusted_supply_gap"] * rainfed_irrigation.astype(float)
+    df["drip_stage_gap"] = df["adjusted_supply_gap"] * drip_irrigation.astype(float)
+    df["moisture_temp_ratio"] = safe_ratio(soil_moisture, temperature, offset=1.0)
+    df["moisture_wind_ratio"] = safe_ratio(soil_moisture, wind, offset=1.0)
+    df["moisture_rainfall_ratio"] = safe_ratio(soil_moisture, rainfall, offset=1.0)
+    df["moisture_et_ratio"] = safe_ratio(soil_moisture, df["evapotranspiration_proxy"], offset=0.1)
+    df["vpd_proxy"] = temperature * humidity_relief
+    df["saturation_vapor_pressure"] = saturation_vapor_pressure
+    df["vpd_kpa"] = saturation_vapor_pressure * humidity_relief
+    df["atmospheric_demand"] = df["vpd_kpa"] * sunlight_plus * wind_root
+    df["atmospheric_demand_log"] = np.log1p(df["atmospheric_demand"])
+    df["atmospheric_demand_per_ha"] = safe_ratio(
+        df["atmospheric_demand"],
+        area,
+        offset=0.1,
+    )
+    df["water_to_atmospheric_demand"] = safe_ratio(
+        water_in,
+        df["atmospheric_demand"],
+        offset=1.0,
+    )
+    df["water_per_ha_to_atmospheric_demand"] = safe_ratio(
+        per_ha_water_in,
+        df["atmospheric_demand"],
+        offset=1.0,
+    )
+    df["soil_buffer_to_atmospheric_demand"] = safe_ratio(
+        soil_moisture,
+        df["atmospheric_demand"],
+        offset=0.5,
+    )
+    df["organic_buffer_to_atmospheric_demand"] = safe_ratio(
+        organic_carbon * soil_moisture,
+        df["atmospheric_demand"],
+        offset=0.5,
+    )
+    df["salinity_atmospheric_risk"] = safe_ratio(
+        conductivity * df["atmospheric_demand"],
+        water_in,
+        offset=1.0,
+    )
+    df["drying_index"] = safe_ratio(sunlight * wind, humidity, offset=1.0)
+    df["net_water_need"] = df["evapotranspiration_proxy"] - rainfall / 10.0
+    df["drought_risk"] = df["drying_index"] * df["moisture_deficit_total"] / 100.0
+    df["water_balance"] = rainfall - previous_irrigation
+    df["water_deficit_signal"] = soil_moisture - 0.1 * water_in
+    df["rain_et_balance"] = rainfall - 2.0 * df["evapotranspiration_proxy"]
+    df["sunlight_temp_ratio"] = safe_ratio(sunlight, temperature, offset=1.0)
+    df["water_stress_index"] = safe_ratio(
+        df["evapotranspiration_proxy"] - water_in / 10.0,
+        soil_moisture,
+        offset=1.0,
+    )
+    df["peak_no_mulch_atmospheric_demand"] = df["atmospheric_demand"] * (
+        peak_stage & no_mulch
+    ).astype(float)
+    df["peak_river_atmospheric_demand"] = df["atmospheric_demand"] * (
+        peak_stage & river_source
+    ).astype(float)
+    df["peak_kharif_atmospheric_demand"] = df["atmospheric_demand"] * (
+        peak_stage & kharif_season
+    ).astype(float)
+    df["peak_no_mulch_demand_supply_ratio"] = safe_ratio(
+        df["atmospheric_demand"],
+        per_ha_water_in,
+        offset=1.0,
+    ) * (peak_stage & no_mulch).astype(float)
+    df["peak_river_demand_supply_ratio"] = safe_ratio(
+        df["atmospheric_demand"],
+        per_ha_water_in,
+        offset=1.0,
+    ) * (peak_stage & river_source).astype(float)
+    df["peak_kharif_demand_supply_ratio"] = safe_ratio(
+        df["atmospheric_demand"],
+        per_ha_water_in,
+        offset=1.0,
+    ) * (peak_stage & kharif_season).astype(float)
     df["is_peak_stage"] = peak_stage.astype(int)
     df["peak_stage_no_mulch"] = (peak_stage & no_mulch).astype(int)
     df["peak_stage_dry"] = (peak_stage & (soil_moisture < 25.0)).astype(int)
+    df["peak_stage_drought"] = df["drought_pressure"] * peak_stage.astype(int)
+    df["peak_stage_no_mulch_drought"] = df["drought_pressure"] * (
+        peak_stage & no_mulch
+    ).astype(int)
+    df["river_peak_no_mulch_drought"] = df["drought_pressure"] * (
+        peak_stage & no_mulch & river_source
+    ).astype(int)
+    df["canal_peak_no_mulch_drought"] = df["drought_pressure"] * (
+        peak_stage & no_mulch & canal_irrigation
+    ).astype(int)
     df["peak_stage_dry_hot"] = (
         peak_stage
         & no_mulch
@@ -282,6 +596,108 @@ def engineer_features(frame: pd.DataFrame, enabled: bool) -> pd.DataFrame:
         + peak_stage.astype(int)
         + no_mulch.astype(int)
     )
+    df["stress_count_alt"] = (
+        (soil_moisture <= 26.0).astype(int)
+        + (temperature >= 30.0).astype(int)
+        + (wind >= 12.0).astype(int)
+        + (rainfall <= 1000.0).astype(int)
+        + (peak_stage & no_mulch).astype(int)
+    )
+    df["high_need_signal_count"] = (
+        2 * (soil_moisture < 25.0).astype(int)
+        + 2 * (rainfall < 300.0).astype(int)
+        + (temperature > 30.0).astype(int)
+        + (wind > 10.0).astype(int)
+    )
+    df["peak_no_mulch_moisture_le_22"] = (
+        peak_stage & no_mulch & (soil_moisture <= 22.0)
+    ).astype(int)
+    df["peak_no_mulch_rain_le_300"] = (
+        peak_stage & no_mulch & (rainfall <= 300.0)
+    ).astype(int)
+    df["peak_no_mulch_wind_gt_15"] = (
+        peak_stage & no_mulch & (wind > 15.0)
+    ).astype(int)
+    df["non_peak_hot_dry_windy"] = (
+        non_peak_stage
+        & (soil_moisture <= 22.0)
+        & (temperature > 32.0)
+        & (wind > 12.0)
+    ).astype(int)
+    df["low_need_signal_count"] = (
+        2 * harvest_stage.astype(int)
+        + 2 * sowing_stage.astype(int)
+        + mulch_yes.astype(int)
+    )
+    df["net_need_signal"] = (
+        df["high_need_signal_count"] - df["low_need_signal_count"]
+    )
+    df[f"{CERTAIN_FEATURE_PREFIX}low_non_peak_mulched_relief"] = (
+        non_peak_stage
+        & mulch_yes
+        & (soil_moisture > 30.0)
+        & (temperature < 30.0)
+    ).astype(int)
+    df[f"{CERTAIN_FEATURE_PREFIX}low_non_peak_mulched_exact"] = (
+        non_peak_stage
+        & mulch_yes
+        & (soil_moisture > 35.0)
+        & (temperature < 30.0)
+        & (rainfall > 300.0)
+    ).astype(int)
+    df[f"{CERTAIN_FEATURE_PREFIX}low_non_peak_nomulch_relief"] = (
+        non_peak_stage
+        & no_mulch
+        & (soil_moisture > 30.0)
+        & (temperature < 28.0)
+    ).astype(int)
+    df[f"{CERTAIN_FEATURE_PREFIX}medium_peak_nomulch_warm_midsoil"] = (
+        peak_stage
+        & no_mulch
+        & soil_mid_25_40
+        & temp_30_35
+    ).astype(int)
+    df[f"{CERTAIN_FEATURE_PREFIX}medium_peak_nomulch_windy_midsoil"] = (
+        peak_stage
+        & no_mulch
+        & soil_mid_25_40
+        & wind_10_15
+    ).astype(int)
+    df[f"{CERTAIN_FEATURE_PREFIX}medium_peak_mulched_wet"] = (
+        peak_stage
+        & mulch_yes
+        & (soil_moisture <= 25.0)
+        & rain_500_1200
+    ).astype(int)
+    df[f"{CERTAIN_FEATURE_PREFIX}medium_peak_mulched_wetter"] = (
+        peak_stage
+        & mulch_yes
+        & (soil_moisture <= 25.0)
+        & (rainfall > 1200.0)
+    ).astype(int)
+    df[f"{CERTAIN_FEATURE_PREFIX}high_peak_nomulch_rain400"] = (
+        peak_stage
+        & no_mulch
+        & (soil_moisture <= 25.0)
+        & (temperature > 30.0)
+        & (wind > 10.0)
+        & (rainfall <= 400.0)
+    ).astype(int)
+    df[f"{CERTAIN_FEATURE_PREFIX}high_peak_nomulch_rain800"] = (
+        peak_stage
+        & no_mulch
+        & (soil_moisture <= 25.0)
+        & (temperature > 30.0)
+        & (wind > 10.0)
+        & (rainfall <= 800.0)
+    ).astype(int)
+    df[f"{CERTAIN_FEATURE_PREFIX}high_peak_nomulch_hot_core"] = (
+        peak_stage
+        & no_mulch
+        & (soil_moisture <= 20.0)
+        & (temperature > 32.0)
+        & (wind > 12.0)
+    ).astype(int)
     df["soil_moisture_band"] = pd.cut(
         soil_moisture,
         bins=[-np.inf, 15.0, 20.0, 25.0, 30.0, 40.0, np.inf],
@@ -306,6 +722,23 @@ def engineer_features(frame: pd.DataFrame, enabled: bool) -> pd.DataFrame:
         labels=["calm", "moderate", "wind_gate", "breezy", "windy"],
         ordered=True,
     )
+    df["drought_pressure_band"] = pd.cut(
+        df["drought_pressure"],
+        bins=[-np.inf, 1.0, 2.0, 3.0, 4.0, 6.0, 10.0, np.inf],
+        labels=["trace", "light", "moderate", "elevated", "high", "severe", "extreme"],
+        ordered=True,
+    )
+    df["stress_count_alt_band"] = pd.cut(
+        df["stress_count_alt"],
+        bins=[-np.inf, 1.0, 2.0, 3.0, 4.0, np.inf],
+        labels=["minimal", "guarded", "elevated", "high", "extreme"],
+        ordered=True,
+    )
+    df["peak_stage_bucket"] = np.where(
+        peak_stage & no_mulch,
+        "peak_no_mulch",
+        np.where(peak_stage, "peak", "other"),
+    )
     df["Crop_Growth_Stage__Mulching_Used"] = (
         df["Crop_Growth_Stage"].astype("string").fillna("Missing")
         + "__"
@@ -326,6 +759,44 @@ def engineer_features(frame: pd.DataFrame, enabled: bool) -> pd.DataFrame:
         + "__"
         + df["Region"].astype("string").fillna("Missing")
     )
+    df["Crop_Growth_Stage__Water_Source"] = (
+        df["Crop_Growth_Stage"].astype("string").fillna("Missing")
+        + "__"
+        + df["Water_Source"].astype("string").fillna("Missing")
+    )
+    df["Crop_Growth_Stage__Irrigation_Type"] = (
+        growth_stage
+        + "__"
+        + irrigation_type
+    )
+    df["Mulching_Used__Irrigation_Type"] = (
+        mulch_used
+        + "__"
+        + irrigation_type
+    )
+    df["Soil_Type__Crop_Type"] = (
+        df["Soil_Type"].astype("string").fillna("Missing")
+        + "__"
+        + df["Crop_Type"].astype("string").fillna("Missing")
+    )
+    df["Region__Season"] = (
+        df["Region"].astype("string").fillna("Missing")
+        + "__"
+        + season
+    )
+    df["Crop_Growth_Stage__Mulching_Used__Water_Source"] = (
+        growth_stage + "__" + mulch_used + "__" + water_source
+    )
+    df["Crop_Growth_Stage__Mulching_Used__Irrigation_Type"] = (
+        growth_stage + "__" + mulch_used + "__" + irrigation_type
+    )
+    df["Crop_Growth_Stage__Mulching_Used__Season"] = (
+        growth_stage + "__" + mulch_used + "__" + season
+    )
+    df["Crop_Growth_Stage__Season"] = growth_stage + "__" + season
+    df["Crop_Type__Crop_Growth_Stage"] = crop_type + "__" + growth_stage
+    df["Mulching_Used__Water_Source"] = mulch_used + "__" + water_source
+    df["Water_Source__Region"] = water_source + "__" + region
 
     return df
 
@@ -551,6 +1022,178 @@ def compute_balanced_class_weights(
             continue
         weights.append(total / (class_count * count))
     return weights
+
+
+def parse_extra_trees_max_features(raw_value: str) -> str | float | int | None:
+    value = str(raw_value).strip().lower()
+    if value in {"sqrt", "log2", "auto"}:
+        return value
+    if value in {"all", "none"}:
+        return None
+    numeric = float(value)
+    if numeric.is_integer() and numeric >= 1.0:
+        return int(numeric)
+    return numeric
+
+
+def build_extra_trees_params(args: argparse.Namespace) -> dict[str, Any]:
+    max_depth = None if args.extra_trees_max_depth <= 0 else args.extra_trees_max_depth
+    return {
+        "n_estimators": args.extra_trees_estimators,
+        "max_depth": max_depth,
+        "min_samples_leaf": args.extra_trees_min_samples_leaf,
+        "max_features": parse_extra_trees_max_features(args.extra_trees_max_features),
+        "criterion": "gini",
+        "class_weight": "balanced_subsample",
+        "n_jobs": -1,
+        "random_state": args.random_state,
+    }
+
+
+def fit_extra_trees_bundle(
+    features: pd.DataFrame,
+    labels: pd.Series,
+    categorical_columns: list[str],
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    if args.ensemble_mode == "none":
+        return None
+
+    numeric_columns = [
+        column for column in features.columns if column not in categorical_columns
+    ]
+    numeric_frame = features[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    numeric_fill_values: dict[str, float] = {}
+    for column in numeric_columns:
+        median = numeric_frame[column].median()
+        numeric_fill_values[column] = (
+            0.0 if pd.isna(median) else float(median)
+        )
+    numeric_frame = numeric_frame.fillna(numeric_fill_values)
+
+    encoder: OrdinalEncoder | None = None
+    encoded_frame = pd.DataFrame(index=features.index)
+    if categorical_columns:
+        categorical_frame = (
+            features[categorical_columns].astype("string").fillna("Missing")
+        )
+        encoder = OrdinalEncoder(
+            handle_unknown="use_encoded_value",
+            unknown_value=-1,
+            encoded_missing_value=-2,
+            dtype=np.float32,
+        )
+        encoded_values = encoder.fit_transform(categorical_frame)
+        encoded_frame = pd.DataFrame(
+            encoded_values,
+            columns=categorical_columns,
+            index=features.index,
+        )
+
+    prepared = pd.concat([numeric_frame, encoded_frame], axis=1)
+    feature_order = prepared.columns.tolist()
+    prepared = prepared.astype(np.float32)
+
+    model = ExtraTreesClassifier(**build_extra_trees_params(args))
+    model.fit(prepared, labels)
+    return {
+        "model": model,
+        "numeric_columns": numeric_columns,
+        "categorical_columns": categorical_columns[:],
+        "numeric_fill_values": numeric_fill_values,
+        "encoder": encoder,
+        "feature_order": feature_order,
+        "params": build_extra_trees_params(args),
+    }
+
+
+def transform_extra_trees_features(
+    features: pd.DataFrame,
+    bundle: dict[str, Any],
+) -> pd.DataFrame:
+    numeric_columns = list(bundle["numeric_columns"])
+    categorical_columns = list(bundle["categorical_columns"])
+    numeric_frame = features[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    numeric_frame = numeric_frame.fillna(bundle["numeric_fill_values"])
+
+    encoded_frame = pd.DataFrame(index=features.index)
+    encoder = bundle["encoder"]
+    if categorical_columns and encoder is not None:
+        categorical_frame = (
+            features[categorical_columns].astype("string").fillna("Missing")
+        )
+        encoded_values = encoder.transform(categorical_frame)
+        encoded_frame = pd.DataFrame(
+            encoded_values,
+            columns=categorical_columns,
+            index=features.index,
+        )
+
+    prepared = pd.concat([numeric_frame, encoded_frame], axis=1)
+    prepared = prepared.loc[:, bundle["feature_order"]]
+    return prepared.astype(np.float32)
+
+
+def predict_extra_trees(
+    features: pd.DataFrame,
+    bundle: dict[str, Any] | None,
+) -> np.ndarray | None:
+    if bundle is None:
+        return None
+    prepared = transform_extra_trees_features(features, bundle)
+    predictions = bundle["model"].predict(prepared)
+    return np.asarray(predictions, dtype=object)
+
+
+def apply_ensemble_selector(
+    catboost_predictions: np.ndarray,
+    features: pd.DataFrame,
+    bundle: dict[str, Any] | None,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    if args.ensemble_mode == "none" or bundle is None:
+        return np.asarray(catboost_predictions, dtype=object)
+
+    extra_predictions = predict_extra_trees(features, bundle)
+    if extra_predictions is None:
+        return np.asarray(catboost_predictions, dtype=object)
+
+    if args.ensemble_mode == "cat_high_else_extra":
+        use_catboost = np.asarray(catboost_predictions, dtype=object) == "High"
+    else:
+        raise ValueError(f"Unsupported ensemble mode: {args.ensemble_mode}")
+
+    return np.where(use_catboost, catboost_predictions, extra_predictions)
+
+
+def predict_labels(
+    model: CatBoostClassifier,
+    features: pd.DataFrame,
+    categorical_columns: list[str],
+    class_scales: dict[str, float],
+    rule_overrides: list[dict[str, Any]],
+    args: argparse.Namespace,
+    ensemble_bundle: dict[str, Any] | None = None,
+) -> np.ndarray:
+    feature_pool = build_pool(features, None, categorical_columns)
+    class_labels = [str(label) for label in model.classes_]
+    probabilities = np.asarray(model.predict_proba(feature_pool))
+    predictions = predict_with_class_scales(
+        probabilities=probabilities,
+        class_labels=class_labels,
+        class_scales=class_scales,
+    )
+    predictions = apply_ensemble_selector(
+        catboost_predictions=predictions,
+        features=features,
+        bundle=ensemble_bundle,
+        args=args,
+    )
+    return apply_rule_overrides(
+        predictions=predictions,
+        features=features,
+        rules=rule_overrides,
+    )
 
 
 def learn_rule_overrides(
@@ -820,11 +1463,136 @@ def select_features_with_boruta(
     return selected_original, summary
 
 
+def prune_positive_contributor_features(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    selected_features: list[str],
+    protected_features: set[str],
+    categorical_columns: list[str],
+    args: argparse.Namespace,
+) -> tuple[list[str], dict[str, Any]]:
+    candidate_features = [
+        column
+        for column in selected_features
+        if column not in protected_features and column not in categorical_columns
+    ]
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "sample_rows": 0,
+        "baseline_score": None,
+        "candidate_feature_count": len(candidate_features),
+        "kept_feature_count": len(candidate_features),
+        "kept_features": candidate_features[:],
+        "dropped_features": [],
+    }
+    if not candidate_features:
+        summary["status"] = "no_numeric_engineered_candidates"
+        return selected_features, summary
+
+    sample_x, sample_y = stratified_subsample(
+        x_train[selected_features],
+        y_train,
+        max_rows=args.positive_pruning_max_rows,
+        random_state=args.random_state + 31,
+    )
+    prune_train_x, prune_cal_x, prune_train_y, prune_cal_y = train_test_split(
+        sample_x,
+        sample_y,
+        test_size=args.validation_size,
+        random_state=args.random_state + 31,
+        stratify=sample_y,
+    )
+    prune_train_x = prune_train_x.reset_index(drop=True)
+    prune_cal_x = prune_cal_x.reset_index(drop=True)
+    prune_train_y = prune_train_y.reset_index(drop=True)
+    prune_cal_y = prune_cal_y.reset_index(drop=True)
+    selected_categorical = [
+        column for column in categorical_columns if column in selected_features
+    ]
+
+    model = CatBoostClassifier(
+        **build_model_params(
+            args,
+            overrides=POSITIVE_PRUNING_PROBE_OVERRIDES,
+        )
+    )
+    model.fit(
+        build_pool(prune_train_x, prune_train_y, selected_categorical),
+        eval_set=build_pool(prune_cal_x, prune_cal_y, selected_categorical),
+        use_best_model=True,
+        early_stopping_rounds=max(40, args.early_stopping_rounds // 2),
+    )
+    baseline_predictions = flatten_predictions(
+        model.predict(build_pool(prune_cal_x, None, selected_categorical))
+    )
+    baseline_score = float(balanced_accuracy_score(prune_cal_y, baseline_predictions))
+    rng = np.random.default_rng(args.random_state + 31)
+    kept_candidates: list[str] = []
+    dropped_features: list[dict[str, Any]] = []
+    contribution_rows: list[dict[str, Any]] = []
+
+    for column in candidate_features:
+        permuted = prune_cal_x.copy()
+        shuffled_values = permuted[column].to_numpy(copy=True)
+        rng.shuffle(shuffled_values)
+        permuted[column] = shuffled_values
+        permuted_predictions = flatten_predictions(
+            model.predict(build_pool(permuted, None, selected_categorical))
+        )
+        permuted_score = float(balanced_accuracy_score(prune_cal_y, permuted_predictions))
+        score_delta = baseline_score - permuted_score
+        contribution_rows.append(
+            {
+                "feature": column,
+                "score_delta": score_delta,
+                "permuted_score": permuted_score,
+            }
+        )
+        if score_delta > 0.0:
+            kept_candidates.append(column)
+        else:
+            dropped_features.append(
+                {
+                    "feature": column,
+                    "score_delta": score_delta,
+                    "permuted_score": permuted_score,
+                }
+            )
+
+    selected_lookup = protected_features | set(kept_candidates)
+    pruned_features = [
+        column for column in selected_features if column in selected_lookup
+    ]
+    contribution_rows.sort(
+        key=lambda item: (-item["score_delta"], item["feature"])
+    )
+    dropped_features.sort(key=lambda item: (item["score_delta"], item["feature"]))
+
+    print(f"positive_pruning_sample_rows: {len(sample_x)}")
+    print(f"positive_pruning_baseline_score: {baseline_score:.10f}")
+    print(f"positive_pruning_candidate_feature_count: {len(candidate_features)}")
+    print(f"positive_pruning_kept_feature_count: {len(kept_candidates)}")
+    print("positive_pruning_feature_deltas:")
+    for row in contribution_rows:
+        print(f"  {row['feature']}: {row['score_delta']:.8f}")
+
+    summary.update(
+        {
+            "sample_rows": len(sample_x),
+            "baseline_score": baseline_score,
+            "kept_feature_count": len(kept_candidates),
+            "kept_features": kept_candidates,
+            "dropped_features": dropped_features,
+            "feature_deltas": contribution_rows,
+            "status": "completed",
+        }
+    )
+    return pruned_features, summary
+
+
 def tune_hyperparameters(
     x_train: pd.DataFrame,
     y_train: pd.Series,
-    x_val: pd.DataFrame,
-    y_val: pd.Series,
     class_names: list[str],
     categorical_columns: list[str],
     args: argparse.Namespace,
@@ -838,9 +1606,20 @@ def tune_hyperparameters(
         max_rows=args.optuna_train_max_rows,
         random_state=args.random_state,
     )
-    train_pool = build_pool(tune_x_train, tune_y_train, categorical_columns)
-    validation_pool = build_pool(x_val, y_val, categorical_columns)
-    base_class_weights = compute_balanced_class_weights(y_train, class_names)
+    inner_train_x, inner_val_x, inner_train_y, inner_val_y = train_test_split(
+        tune_x_train,
+        tune_y_train,
+        test_size=args.validation_size,
+        random_state=args.random_state + 23,
+        stratify=tune_y_train,
+    )
+    inner_train_x = inner_train_x.reset_index(drop=True)
+    inner_val_x = inner_val_x.reset_index(drop=True)
+    inner_train_y = inner_train_y.reset_index(drop=True)
+    inner_val_y = inner_val_y.reset_index(drop=True)
+    train_pool = build_pool(inner_train_x, inner_train_y, categorical_columns)
+    validation_pool = build_pool(inner_val_x, inner_val_y, categorical_columns)
+    base_class_weights = compute_balanced_class_weights(inner_train_y, class_names)
 
     def objective(trial: optuna.Trial) -> float:
         overrides: dict[str, Any] = {
@@ -894,7 +1673,7 @@ def tune_hyperparameters(
             early_stopping_rounds=args.early_stopping_rounds,
         )
         predictions = flatten_predictions(model.predict(validation_pool))
-        score = balanced_accuracy_score(y_val, predictions)
+        score = balanced_accuracy_score(inner_val_y, predictions)
         trial.set_user_attr("best_iteration", resolved_best_iteration(model))
         return score
 
@@ -929,6 +1708,8 @@ def tune_hyperparameters(
         best_params["auto_class_weights"] = None
 
     print(f"tuning_train_rows: {len(tune_x_train)}")
+    print(f"tuning_inner_train_rows: {len(inner_train_x)}")
+    print(f"tuning_inner_validation_rows: {len(inner_val_x)}")
     print(f"optuna_trials_completed: {len(study.trials)}")
     print(f"optuna_best_validation_score: {study.best_value:.10f}")
     print(
@@ -939,6 +1720,8 @@ def tune_hyperparameters(
     summary = {
         "enabled": True,
         "tuning_train_rows": len(tune_x_train),
+        "tuning_inner_train_rows": len(inner_train_x),
+        "tuning_inner_validation_rows": len(inner_val_x),
         "completed_trials": len(study.trials),
         "best_validation_score": float(study.best_value),
         "best_params": best_params,
@@ -960,6 +1743,7 @@ def fit_validation_model(
     model_overrides: dict[str, Any] | None = None,
 ) -> tuple[
     CatBoostClassifier,
+    dict[str, Any] | None,
     float,
     dict[str, float],
     list[dict[str, Any]],
@@ -976,6 +1760,12 @@ def fit_validation_model(
         early_stopping_rounds=args.early_stopping_rounds,
     )
 
+    ensemble_bundle = fit_extra_trees_bundle(
+        features=x_train,
+        labels=y_train,
+        categorical_columns=categorical_columns,
+        args=args,
+    )
     class_scales = learn_class_scale_map(
         x_train=x_train,
         y_train=y_train,
@@ -989,19 +1779,33 @@ def fit_validation_model(
         class_names=class_names,
         args=args,
     )
-    class_labels = [str(label) for label in model.classes_]
-    validation_probabilities = np.asarray(model.predict_proba(validation_pool))
-    validation_predictions = predict_with_class_scales(
-        probabilities=validation_probabilities,
-        class_labels=class_labels,
-        class_scales=class_scales,
-    )
-    validation_predictions = apply_rule_overrides(
-        predictions=validation_predictions,
+    validation_predictions = predict_labels(
+        model=model,
         features=x_val,
-        rules=rule_overrides,
+        categorical_columns=categorical_columns,
+        class_scales=class_scales,
+        rule_overrides=rule_overrides,
+        args=args,
+        ensemble_bundle=ensemble_bundle,
     )
     balanced_accuracy = balanced_accuracy_score(y_val, validation_predictions)
+    if ensemble_bundle is not None:
+        base_predictions = predict_labels(
+            model=model,
+            features=x_val,
+            categorical_columns=categorical_columns,
+            class_scales=class_scales,
+            rule_overrides=rule_overrides,
+            args=argparse.Namespace(**{**vars(args), "ensemble_mode": "none"}),
+            ensemble_bundle=None,
+        )
+        base_score = balanced_accuracy_score(y_val, base_predictions)
+        changed_predictions = int(
+            np.sum(np.asarray(base_predictions, dtype=object) != validation_predictions)
+        )
+        print(f"ensemble_mode: {args.ensemble_mode}")
+        print(f"ensemble_base_catboost_score: {base_score:.10f}")
+        print(f"ensemble_changed_predictions: {changed_predictions}")
     best_iteration = resolved_best_iteration(model)
     tree_count = int(model.tree_count_)
 
@@ -1019,6 +1823,7 @@ def fit_validation_model(
     )
     return (
         model,
+        ensemble_bundle,
         float(balanced_accuracy),
         per_class_recall,
         rule_overrides,
@@ -1054,6 +1859,7 @@ def write_submission(
     categorical_columns: list[str],
     rule_overrides: list[dict[str, Any]],
     class_scales: dict[str, float],
+    ensemble_bundle: dict[str, Any] | None,
     args: argparse.Namespace,
 ) -> None:
     submission_df = pd.read_csv(args.sample_submission_path)
@@ -1065,18 +1871,14 @@ def write_submission(
             f"Missing target column '{args.target_column}' in {args.sample_submission_path}"
         )
 
-    test_pool = build_pool(test_df[feature_columns], None, categorical_columns)
-    class_labels = [str(label) for label in model.classes_]
-    submission_probabilities = np.asarray(model.predict_proba(test_pool))
-    submission_predictions = predict_with_class_scales(
-        probabilities=submission_probabilities,
-        class_labels=class_labels,
-        class_scales=class_scales,
-    )
-    submission_predictions = apply_rule_overrides(
-        predictions=submission_predictions,
+    submission_predictions = predict_labels(
+        model=model,
         features=test_df[feature_columns],
-        rules=rule_overrides,
+        categorical_columns=categorical_columns,
+        class_scales=class_scales,
+        rule_overrides=rule_overrides,
+        args=args,
+        ensemble_bundle=ensemble_bundle,
     )
 
     submission_df[args.id_column] = test_df[args.id_column].to_numpy()
@@ -1130,20 +1932,16 @@ def main() -> None:
             for column in categorical_columns
             if column not in raw_categorical_columns
         ]
-        boruta_candidate_features = [
-            column
-            for column in engineered_feature_columns
-            if column not in engineered_categorical_columns
-        ]
+        boruta_candidate_features = engineered_feature_columns[:]
         boruta_selected_features, boruta_summary = select_features_with_boruta(
             x_train=x_train[boruta_candidate_features],
             y_train=y_train,
             feature_columns=boruta_candidate_features,
-            categorical_columns=[],
+            categorical_columns=engineered_categorical_columns,
             class_names=class_names,
             args=args,
         )
-        protected_features = set(raw_feature_columns + engineered_categorical_columns)
+        protected_features = set(raw_feature_columns)
         selected_lookup = protected_features | set(boruta_selected_features)
         selected_features = [
             column for column in feature_columns if column in selected_lookup
@@ -1152,6 +1950,16 @@ def main() -> None:
         boruta_summary["protected_features"] = [
             column for column in feature_columns if column in protected_features
         ]
+        if args.boruta_positive_pruning:
+            selected_features, positive_pruning_summary = prune_positive_contributor_features(
+                x_train=x_train,
+                y_train=y_train,
+                selected_features=selected_features,
+                protected_features=protected_features,
+                categorical_columns=categorical_columns,
+                args=args,
+            )
+            boruta_summary["positive_pruning"] = positive_pruning_summary
 
     selected_categorical_columns = [
         column for column in categorical_columns if column in selected_features
@@ -1162,8 +1970,6 @@ def main() -> None:
     tuning_overrides, tuning_summary = tune_hyperparameters(
         x_train=x_train[selected_features],
         y_train=y_train,
-        x_val=x_val[selected_features],
-        y_val=y_val,
         class_names=class_names,
         categorical_columns=selected_categorical_columns,
         args=args,
@@ -1171,6 +1977,7 @@ def main() -> None:
 
     (
         validation_model,
+        validation_ensemble_bundle,
         balanced_accuracy,
         per_class_recall,
         rule_overrides,
@@ -1187,6 +1994,14 @@ def main() -> None:
     )
 
     final_model_params = build_model_params(args, overrides=tuning_overrides or None)
+    ensemble_summary: dict[str, Any] = {
+        "mode": args.ensemble_mode,
+        "enabled": args.ensemble_mode != "none",
+        "artifact_path": str(args.ensemble_artifact_path),
+    }
+    if validation_ensemble_bundle is not None:
+        ensemble_summary["extra_trees_params"] = validation_ensemble_bundle["params"]
+        ensemble_summary["feature_order"] = validation_ensemble_bundle["feature_order"]
     metadata: dict[str, Any] = {
         "target_column": args.target_column,
         "id_column": args.id_column,
@@ -1195,6 +2010,7 @@ def main() -> None:
         "engineered_features_enabled": args.engineered_features,
         "boruta": boruta_summary,
         "optuna": tuning_summary,
+        "ensemble": ensemble_summary,
         "rule_overrides": rule_overrides,
         "class_scales": class_scales,
         "feature_columns": selected_features,
@@ -1224,6 +2040,12 @@ def main() -> None:
         args=args,
         model_overrides=tuning_overrides or None,
     )
+    full_ensemble_bundle = fit_extra_trees_bundle(
+        features=train_df[selected_features],
+        labels=train_df[args.target_column],
+        categorical_columns=selected_categorical_columns,
+        args=args,
+    )
     full_rule_overrides = learn_rule_overrides(
         features=train_df[selected_features],
         labels=train_df[args.target_column],
@@ -1240,6 +2062,11 @@ def main() -> None:
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
     full_model.save_model(args.model_path)
     print(f"saved_model_path: {args.model_path}")
+    if full_ensemble_bundle is not None:
+        args.ensemble_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        with args.ensemble_artifact_path.open("wb") as handle:
+            pickle.dump(full_ensemble_bundle, handle)
+        print(f"saved_ensemble_artifact_path: {args.ensemble_artifact_path}")
 
     raw_test_df = pd.read_csv(args.test_path)
     test_df = engineer_features(raw_test_df, enabled=args.engineered_features)
@@ -1250,6 +2077,7 @@ def main() -> None:
         categorical_columns=selected_categorical_columns,
         rule_overrides=full_rule_overrides,
         class_scales=full_class_scales,
+        ensemble_bundle=full_ensemble_bundle,
         args=args,
     )
 
@@ -1257,6 +2085,8 @@ def main() -> None:
     metadata["refit_iterations"] = int(validation_model.tree_count_)
     metadata["full_rule_overrides"] = full_rule_overrides
     metadata["full_class_scales"] = full_class_scales
+    if full_ensemble_bundle is not None:
+        metadata["ensemble"]["saved_artifact_path"] = str(args.ensemble_artifact_path)
     save_json(metadata, args.metadata_path)
     print(f"saved_metadata_path: {args.metadata_path}")
 
